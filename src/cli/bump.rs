@@ -10,10 +10,11 @@ use crate::audit::report;
 use crate::bump::diff::{
     diff_conflicts, diff_cves, diff_graphs, ConflictDiff, CveDelta, GraphDiff,
 };
-use crate::bump::runner;
+use crate::bump::runner::{self, VerifyResult};
 use crate::bump::scorer::{
     self, recommended_actions, Action, RiskAssessment, RiskLevel, ScoringInputs,
 };
+use crate::bump::strategy::{self, FixStrategy};
 use crate::cli::list::collect_or_cache;
 use crate::collector::{maven::CollectGoals, verbose_tree};
 use crate::graph::builder::{self, DepGraph};
@@ -49,6 +50,7 @@ pub fn run(
     output_format: &str,
     spec: &str,
     target_version_opt: Option<&str>,
+    verify: bool,
     fresh: bool,
     offline: bool,
 ) -> Result<BumpOutcome> {
@@ -141,7 +143,7 @@ pub fn run(
     }
     let override_output_dir = pom_dir.join(".depintel").join("bump-preview");
 
-    let override_raw = runner::collect_with_override(
+    let override_result = runner::collect_with_override(
         pom_dir,
         &override_output_dir,
         &group,
@@ -152,6 +154,7 @@ pub fn run(
             verbose_tree: true,
             dep_list: false,
         },
+        verify,
     )
     .with_context(|| {
         format!(
@@ -161,6 +164,8 @@ pub fn run(
         )
     })?;
 
+    let verify_result = override_result.verify;
+    let override_raw = override_result.maven_output;
     let override_trees = verbose_tree::parse_verbose_tree(&override_raw.verbose_tree)?;
     if override_trees.is_empty() {
         anyhow::bail!("Override Maven output is empty — the mutated POM produced no tree.");
@@ -238,7 +243,7 @@ pub fn run(
         .map(|reqs| reqs.iter().any(|r| r.managed_from.is_some()))
         .unwrap_or(false);
 
-    let assessment = scorer::score(&ScoringInputs {
+    let mut assessment = scorer::score(&ScoringInputs {
         from_version: &baseline_version,
         to_version: &target_version,
         scope: &baseline_scope,
@@ -249,7 +254,24 @@ pub fn run(
         managed_override,
     });
 
+    // If build verification failed, raise risk to at least HIGH.
+    if let Some(ref vr) = verify_result {
+        if !vr.success {
+            assessment.level = assessment.level.raise_to(RiskLevel::High);
+            assessment.reasons.push("build_verification_failed".to_string());
+        }
+    }
+
     let actions = recommended_actions(assessment.level, &baseline_version, &target_version, &cve_delta);
+
+    // Fix strategy: how should the user actually apply this change?
+    let is_direct = baseline_graph
+        .get_requests(&key)
+        .map(|reqs| reqs.iter().any(|r| r.selected && r.path.len() <= 2))
+        .unwrap_or(false);
+    let fix_strat = strategy::analyze_fix_strategy(
+        pom_dir, &group, &artifact, &baseline_version, &target_version, is_direct,
+    ).ok();
 
     let preview = BumpPreview {
         artifact: ArtifactSpec {
@@ -263,6 +285,8 @@ pub fn run(
         conflicts: &conflict_diff,
         cves: &cve_delta,
         actions: &actions,
+        fix_strategy: fix_strat.as_ref(),
+        verify: verify_result.as_ref(),
     };
 
     match output_format {
@@ -362,6 +386,10 @@ struct BumpPreview<'a> {
     cves: &'a CveDelta,
     #[serde(rename = "recommended_actions")]
     actions: &'a [Action],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix_strategy: Option<&'a FixStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify: Option<&'a VerifyResult>,
 }
 
 fn print_json(preview: &BumpPreview) -> Result<()> {
@@ -531,6 +559,32 @@ fn print_text(preview: &BumpPreview, scope: &str) {
     println!();
 
     // --- Recommended actions ---
+    // --- Build verification ---
+    if let Some(ref vr) = preview.verify {
+        if vr.success {
+            println!("  Build verification: {}", color::green("PASS"));
+        } else {
+            println!("  Build verification: {}", color::red("FAIL"));
+            if let Some(ref err) = vr.error_output {
+                for line in err.lines().take(10) {
+                    println!("    {}", color::dim(line));
+                }
+            }
+        }
+        println!();
+    }
+
+    // --- Fix strategy ---
+    if let Some(ref fs) = preview.fix_strategy {
+        println!("  {}:", color::bold("Fix strategy"));
+        println!("    Method: {}", color::cyan(&fs.method));
+        println!("    {}", fs.instruction);
+        if let Some(ref file) = fs.file {
+            println!("    File: {}", color::dim(file));
+        }
+        println!();
+    }
+
     println!("  {}:", color::bold("Recommended actions"));
     for (i, action) in preview.actions.iter().enumerate() {
         let (label, detail) = match action {

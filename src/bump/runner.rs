@@ -6,10 +6,27 @@
 //! left behind as evidence and future runs detect it.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::bump::mutator::{discover_module_poms, mutate_pom_xml, try_patch_in_place};
 use crate::collector::maven::{self, CollectGoals, MavenOutput};
+
+/// Result of running `mvn compile` to verify a bump.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifyResult {
+    pub success: bool,
+    /// First ~20 lines of error output if the build failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_output: Option<String>,
+}
+
+/// Combined result from override collection + optional build verification.
+pub struct OverrideResult {
+    pub maven_output: MavenOutput,
+    pub verify: Option<VerifyResult>,
+}
 
 const BACKUP_SUFFIX: &str = ".depintel-bump-backup";
 
@@ -124,7 +141,8 @@ pub fn collect_with_override(
     artifact: &str,
     target_version: &str,
     goals: CollectGoals,
-) -> Result<MavenOutput> {
+    verify: bool,
+) -> Result<OverrideResult> {
     // Discover every reachable pom.xml in the reactor.
     let module_poms = discover_module_poms(pom_dir).with_context(|| {
         format!("Failed to enumerate module poms under {}", pom_dir.display())
@@ -184,12 +202,60 @@ pub fn collect_with_override(
     // Run Maven. Errors propagate; Drop restores all POMs.
     let result = maven::collect_to(pom_dir, override_output_dir, goals);
 
+    // If Maven succeeded and verify is requested, run `mvn compile` while POM is still mutated.
+    let verify_result = if verify && result.is_ok() {
+        match maven::discover_mvn(pom_dir) {
+            Ok(mvn) => {
+                eprintln!("Verifying build with mutated POM...");
+                let output = Command::new(&mvn)
+                    .args(["compile", "-q", "-B"])
+                    .current_dir(pom_dir)
+                    .output();
+                match output {
+                    Ok(o) => {
+                        if o.status.success() {
+                            Some(VerifyResult {
+                                success: true,
+                                error_output: None,
+                            })
+                        } else {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            let combined = format!("{}\n{}", stdout, stderr);
+                            let truncated: String = combined
+                                .lines()
+                                .filter(|l| l.contains("[ERROR]") || l.contains("COMPILATION ERROR"))
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            Some(VerifyResult {
+                                success: false,
+                                error_output: Some(if truncated.is_empty() {
+                                    combined.lines().take(20).collect::<Vec<_>>().join("\n")
+                                } else {
+                                    truncated
+                                }),
+                            })
+                        }
+                    }
+                    Err(e) => Some(VerifyResult {
+                        success: false,
+                        error_output: Some(format!("Failed to run mvn compile: {}", e)),
+                    }),
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Restore explicitly so we get a proper error instead of a silent drop.
-    // If BOTH Maven and restore fail, surface Maven's error as the root cause
-    // and tack on the restore failure as additional context — dropping either
-    // side hides the real story from the user.
     match (result, backup.restore()) {
-        (Ok(out), Ok(())) => Ok(out),
+        (Ok(out), Ok(())) => Ok(OverrideResult {
+            maven_output: out,
+            verify: verify_result,
+        }),
         (Err(maven_err), Ok(())) => Err(maven_err.context(format!(
             "Maven failed while analysing override {}:{} → {}. \
              The original pom.xml has been restored.",

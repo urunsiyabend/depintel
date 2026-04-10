@@ -179,7 +179,49 @@ Summary: 42 CRITICAL, 5 HIGH, 5 MEDIUM, 0 LOW
 The `-> upgrade X -> Y` line is heuristic: Y is the fixed-version that closes
 the largest number of findings. It's a starting point, not a blind recommendation.
 
-Flags: `--severity low|medium|high|critical`, `--include-test`, `--fresh-cves`.
+Flags: `--severity low|medium|high|critical`, `--include-test`, `--fresh-cves`,
+`--scan-usage`, `--fix-plan`.
+
+#### `--scan-usage` — CVE applicability analysis
+
+Scans your project's source files for imports of vulnerable packages and reports
+whether each CVE is likely applicable:
+
+```
+$ depintel --pom . audit --scan-usage
+  org.apache.logging.log4j:log4j-core 2.14.1  (compile) [direct]
+    Applicability: HIGH — found 3 import(s) in 2 file(s)
+      src/main/java/com/example/LogConfig.java
+      src/main/java/com/example/App.java
+    CRITICAL  CVE-2021-44228  ...
+
+  io.netty:netty-codec-smtp 4.1.124  (compile) [transitive]
+    Applicability: LOW — no imports of io.netty.handler.codec.smtp found in source
+    HIGH      CVE-2025-59419  ...
+```
+
+#### `--fix-plan` — batch upgrade strategy
+
+Computes the minimum set of upgrades to close the maximum number of CVEs:
+
+```
+$ depintel --pom . audit --fix-plan
+FIX PLAN: 3 upgrade(s) to fix 45 of 47 CVEs
+
+  1. com.fasterxml.jackson.core:jackson-databind
+     2.9.10 -> 2.9.10.8
+     Fixes: 39 CRITICAL, 4 HIGH (43 CVEs)
+
+  2. org.apache.logging.log4j:log4j-core
+     2.14.1 -> 2.17.1
+     Fixes: 3 CRITICAL, 1 HIGH, 1 MEDIUM (5 CVEs)
+
+  3. com.squareup.okhttp3:okhttp
+     4.9.0 -> 4.9.2
+     Fixes: 1 HIGH (1 CVE)
+
+  2 CVEs have no known fix version.
+```
 
 **Caveat.** OSV-based scanning reads Maven coordinates — it does not unpack JARs.
 If your pipeline uses shading or fat-jars, pair depintel with OWASP
@@ -215,6 +257,11 @@ BUMP PREVIEW: com.google.guava:guava 32.1.3-jre -> 33.0-jre
 
   New conflicts: none
 
+  Fix strategy:
+    Method: property
+    Set <guava.version>33.0-jre</guava.version>
+    File: pom.xml
+
   Recommended actions:
     1. Run tests: major version bump, run full test suite
     2. Review changelog: check guava 33.x release notes for breaking changes
@@ -222,8 +269,12 @@ BUMP PREVIEW: com.google.guava:guava 32.1.3-jre -> 33.0-jre
 
 The POM is always restored to its original state after the preview.
 
-Flags: `--to <version>`. Accepts full Maven coordinates (`group:artifact:version`
-or `group:artifact --to version`). Returns exit code 2 on HIGH/CRITICAL risk.
+Flags: `--to <version>`, `--verify`. Accepts full Maven coordinates
+(`group:artifact:version` or `group:artifact --to version`). Returns exit code 2
+on HIGH/CRITICAL risk.
+
+`--verify` runs `mvn compile` against the mutated POM to check if the project
+still compiles with the new version. If the build fails, risk is raised to HIGH.
 
 ## `--pom-url`: analyze remote projects without cloning
 

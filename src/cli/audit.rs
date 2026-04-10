@@ -1,7 +1,9 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::audit::applicability::{self, ApplicabilityLevel, ApplicabilityResult};
 use crate::audit::cache::OsvCache;
+use crate::audit::fix_plan;
 use crate::audit::osv::{OsvClient, VulnSeverity};
 use crate::audit::report::{build_report, AuditFinding, AuditReport, AuditSummary};
 use crate::cli::list::collect_or_cache;
@@ -9,6 +11,7 @@ use crate::collector::{maven::CollectGoals, verbose_tree};
 use crate::graph::builder;
 use crate::output::color;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     pom_dir: &Path,
     output_format: &str,
@@ -16,6 +19,8 @@ pub fn run(
     severity_filter: Option<&str>,
     include_test: bool,
     fresh_cves: bool,
+    scan_usage: bool,
+    fix_plan_flag: bool,
     fresh: bool,
     offline: bool,
 ) -> Result<()> {
@@ -83,9 +88,39 @@ pub fn run(
         reports.push(report);
     }
 
+    // Applicability scan
+    let applicability_results: Option<Vec<Vec<ApplicabilityResult>>> = if scan_usage {
+        Some(
+            reports
+                .iter()
+                .map(|report| {
+                    report
+                        .findings
+                        .iter()
+                        .map(|f| applicability::scan_usage(pom_dir, &f.group, &f.artifact))
+                        .collect()
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    // Fix plan
+    let plan = if fix_plan_flag {
+        Some(fix_plan::compute_fix_plan(&reports))
+    } else {
+        None
+    };
+
     match output_format {
-        "json" => print_json(&reports)?,
-        _ => print_text(&reports),
+        "json" => print_json(&reports, &applicability_results, &plan)?,
+        _ => {
+            print_text(&reports, &applicability_results);
+            if let Some(ref p) = plan {
+                print_fix_plan_text(p);
+            }
+        }
     }
 
     // CI gate: exit 2 if any HIGH or CRITICAL findings remain after filtering.
@@ -117,7 +152,10 @@ fn severity_color(sev: VulnSeverity, text: &str) -> String {
     }
 }
 
-fn print_text(reports: &[AuditReport]) {
+fn print_text(
+    reports: &[AuditReport],
+    applicability: &Option<Vec<Vec<ApplicabilityResult>>>,
+) {
     let total: usize = reports.iter().map(|r| r.findings.len()).sum();
     if total == 0 {
         let scanned: usize = reports.iter().map(|r| r.artifacts_scanned).sum();
@@ -130,7 +168,7 @@ fn print_text(reports: &[AuditReport]) {
         return;
     }
 
-    for report in reports {
+    for (ri, report) in reports.iter().enumerate() {
         if report.findings.is_empty() {
             continue;
         }
@@ -143,8 +181,12 @@ fn print_text(reports: &[AuditReport]) {
         );
         println!();
 
-        for finding in &report.findings {
-            print_finding(finding);
+        for (fi, finding) in report.findings.iter().enumerate() {
+            let app = applicability
+                .as_ref()
+                .and_then(|a| a.get(ri))
+                .and_then(|r| r.get(fi));
+            print_finding(finding, app);
         }
 
         println!(
@@ -163,7 +205,7 @@ fn print_text(reports: &[AuditReport]) {
     }
 }
 
-fn print_finding(f: &AuditFinding) {
+fn print_finding(f: &AuditFinding, applicability: Option<&ApplicabilityResult>) {
     let coord = format!("{}:{}", f.group, f.artifact);
     let direct_tag = if f.direct {
         color::dim("[direct]")
@@ -171,7 +213,6 @@ fn print_finding(f: &AuditFinding) {
         color::dim("[transitive]")
     };
 
-    // Per-artifact header: severity counts inside the dep + coord + version + context.
     let mut crit = 0;
     let mut high = 0;
     let mut med = 0;
@@ -186,18 +227,10 @@ fn print_finding(f: &AuditFinding) {
         }
     }
     let mut severity_summary: Vec<String> = Vec::new();
-    if crit > 0 {
-        severity_summary.push(color::red(&format!("{} CRITICAL", crit)));
-    }
-    if high > 0 {
-        severity_summary.push(color::red(&format!("{} HIGH", high)));
-    }
-    if med > 0 {
-        severity_summary.push(color::yellow(&format!("{} MEDIUM", med)));
-    }
-    if low > 0 {
-        severity_summary.push(color::dim(&format!("{} LOW", low)));
-    }
+    if crit > 0 { severity_summary.push(color::red(&format!("{} CRITICAL", crit))); }
+    if high > 0 { severity_summary.push(color::red(&format!("{} HIGH", high))); }
+    if med > 0 { severity_summary.push(color::yellow(&format!("{} MEDIUM", med))); }
+    if low > 0 { severity_summary.push(color::dim(&format!("{} LOW", low))); }
 
     println!(
         "{} {} {}  {} {}  ({})",
@@ -209,8 +242,26 @@ fn print_finding(f: &AuditFinding) {
         severity_summary.join(", ")
     );
 
-    // Show top vulns sorted by severity (descending). Cap to 5 by default;
-    // remaining count printed at bottom.
+    // Applicability
+    if let Some(app) = applicability {
+        let level_str = match app.level {
+            ApplicabilityLevel::High => color::red("HIGH"),
+            ApplicabilityLevel::Low => color::green("LOW"),
+            ApplicabilityLevel::Unknown => color::dim("UNKNOWN"),
+        };
+        println!(
+            "    Applicability: {} — {}",
+            level_str,
+            app.detail
+        );
+        for mf in app.matching_files.iter().take(3) {
+            println!("      {}", color::dim(mf));
+        }
+        if app.matching_files.len() > 3 {
+            println!("      {}", color::dim(&format!("({} more files)", app.matching_files.len() - 3)));
+        }
+    }
+
     let mut vulns = f.vulnerabilities.clone();
     vulns.sort_by(|a, b| b.severity.cmp(&a.severity));
     let max_vulns = 5;
@@ -243,7 +294,6 @@ fn print_finding(f: &AuditFinding) {
         );
     }
 
-    // Recommended fix: lowest fixed version that beats them all (best-effort).
     let recommended = recommend_upgrade(&vulns);
     if let Some(target) = recommended {
         println!(
@@ -254,7 +304,6 @@ fn print_finding(f: &AuditFinding) {
         );
     }
 
-    // Paths (top 3)
     if !f.paths.is_empty() && !f.direct {
         for (i, p) in f.paths.iter().take(3).enumerate() {
             let path_str = p[1..].join(" → ");
@@ -275,8 +324,6 @@ fn print_finding(f: &AuditFinding) {
     println!();
 }
 
-/// Pick the smallest fixed version that appears across the most CVEs — a heuristic
-/// "if you upgrade to X, you patch the most things at once".
 fn recommend_upgrade(vulns: &[crate::audit::osv::Vulnerability]) -> Option<String> {
     use std::collections::HashMap;
     let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -291,7 +338,75 @@ fn recommend_upgrade(vulns: &[crate::audit::osv::Vulnerability]) -> Option<Strin
         .map(|(v, _)| v.to_string())
 }
 
-fn print_json(reports: &[AuditReport]) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(reports)?);
+fn print_fix_plan_text(plan: &fix_plan::FixPlan) {
+    println!();
+    let total = plan.total_cves_fixed + plan.total_cves_remaining;
+    let upgrades_with_fixes: Vec<_> = plan.upgrades.iter().filter(|u| u.cves_fixed_count > 0).collect();
+
+    println!(
+        "{} {} upgrade(s) to fix {} of {} CVE(s)",
+        color::bold("FIX PLAN:"),
+        upgrades_with_fixes.len(),
+        color::green(&plan.total_cves_fixed.to_string()),
+        total,
+    );
+    println!();
+
+    for (i, upgrade) in upgrades_with_fixes.iter().enumerate() {
+        println!(
+            "  {}. {}:{}",
+            i + 1,
+            color::bold(&upgrade.group),
+            color::bold(&upgrade.artifact),
+        );
+        println!(
+            "     {} → {}",
+            color::dim(&upgrade.from_version),
+            color::green(&upgrade.to_version),
+        );
+        println!(
+            "     Fixes: {} ({} CVE(s))",
+            upgrade.severity_summary,
+            upgrade.cves_fixed_count,
+        );
+        if !upgrade.cves_remaining.is_empty() {
+            println!(
+                "     Remaining: {} CVE(s) with no fix in this version",
+                upgrade.cves_remaining.len(),
+            );
+        }
+        println!();
+    }
+
+    if plan.total_cves_remaining > 0 {
+        println!(
+            "  {} CVE(s) have no known fix version.",
+            color::yellow(&plan.total_cves_remaining.to_string()),
+        );
+        println!();
+    }
+}
+
+fn print_json(
+    reports: &[AuditReport],
+    applicability: &Option<Vec<Vec<ApplicabilityResult>>>,
+    plan: &Option<fix_plan::FixPlan>,
+) -> Result<()> {
+    // Build a combined JSON output
+    let mut output = serde_json::json!({
+        "reports": reports,
+    });
+
+    if let Some(ref app) = applicability {
+        // Attach applicability results alongside findings
+        let app_flat: Vec<&ApplicabilityResult> = app.iter().flat_map(|r| r.iter()).collect();
+        output["applicability"] = serde_json::to_value(app_flat)?;
+    }
+
+    if let Some(ref p) = plan {
+        output["fix_plan"] = serde_json::to_value(p)?;
+    }
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }

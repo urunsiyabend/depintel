@@ -102,6 +102,14 @@ enum Commands {
         /// Force a fresh OSV lookup, bypassing the local CVE cache
         #[arg(long)]
         fresh_cves: bool,
+
+        /// Scan source files for usage of vulnerable packages to assess applicability
+        #[arg(long)]
+        scan_usage: bool,
+
+        /// Show a fix plan: minimum upgrades to close maximum CVEs
+        #[arg(long)]
+        fix_plan: bool,
     },
 
     /// Preview the graph-level impact of changing a dependency version
@@ -112,6 +120,10 @@ enum Commands {
         /// Target version (required unless embedded in `artifact`)
         #[arg(long = "to")]
         to: Option<String>,
+
+        /// Run mvn compile to verify the bump does not break the build
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -194,6 +206,8 @@ fn run(cli: Cli) -> Result<i32> {
             severity,
             include_test,
             fresh_cves,
+            scan_usage,
+            fix_plan,
         } => {
             cli::audit::run(
                 &pom_dir,
@@ -202,16 +216,19 @@ fn run(cli: Cli) -> Result<i32> {
                 severity.as_deref(),
                 include_test,
                 fresh_cves,
+                scan_usage,
+                fix_plan,
                 cli.fresh,
                 cli.offline,
             )?;
         }
-        Commands::Bump { artifact, to } => {
+        Commands::Bump { artifact, to, verify } => {
             let outcome = cli::bump::run(
                 &pom_dir,
                 &cli.output,
                 &artifact,
                 to.as_deref(),
+                verify,
                 cli.fresh,
                 cli.offline,
             )?;

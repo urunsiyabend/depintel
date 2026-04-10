@@ -27,7 +27,7 @@ impl RiskLevel {
         }
     }
 
-    fn raise_to(self, target: RiskLevel) -> RiskLevel {
+    pub fn raise_to(self, target: RiskLevel) -> RiskLevel {
         if target > self {
             target
         } else {

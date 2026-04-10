@@ -21,7 +21,7 @@ pub struct MavenOutput {
 ///    - Scoop, Chocolatey, SDKMAN
 ///
 /// Returns the full path to the executable.
-fn discover_mvn(pom_dir: &Path) -> Result<PathBuf> {
+pub fn discover_mvn(pom_dir: &Path) -> Result<PathBuf> {
     // 0. mvnd (Maven Daemon) — fastest option, check first
     for daemon_name in &["mvnd.cmd", "mvnd"] {
         // Check in project dir (mvndw equivalent)
