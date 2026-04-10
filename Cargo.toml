@@ -1,6 +1,6 @@
 [package]
 name = "depintel"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Maven dependency intelligence CLI — conflict scoring, path tracing, CVE audit"
 license = "MIT"

@@ -112,6 +112,9 @@ enum Commands {
         fix_plan: bool,
     },
 
+    /// Update depintel to the latest release
+    Update,
+
     /// Preview the graph-level impact of changing a dependency version
     Bump {
         /// Target in group:artifact or group:artifact:version form
@@ -144,6 +147,12 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // Update doesn't need a POM — handle it early.
+    if matches!(cli.command, Commands::Update) {
+        cli::update::run()?;
+        return Ok(0);
+    }
+
     if !matches!(cli.output.as_str(), "text" | "json") {
         anyhow::bail!(
             "Unknown output format '{}'. Use: text, json",
@@ -209,7 +218,7 @@ fn run(cli: Cli) -> Result<i32> {
             scan_usage,
             fix_plan,
         } => {
-            cli::audit::run(
+            let outcome = cli::audit::run(
                 &pom_dir,
                 &cli.output,
                 cli.module.as_deref(),
@@ -221,7 +230,11 @@ fn run(cli: Cli) -> Result<i32> {
                 cli.fresh,
                 cli.offline,
             )?;
+            if matches!(outcome, cli::audit::AuditOutcome::Blocking) {
+                return Ok(2);
+            }
         }
+        Commands::Update => unreachable!("handled above"),
         Commands::Bump { artifact, to, verify } => {
             let outcome = cli::bump::run(
                 &pom_dir,

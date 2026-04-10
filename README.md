@@ -32,6 +32,12 @@ Requires Rust 1.74+.
 cargo install --git https://github.com/urunsiyabend/depintel.git
 ```
 
+### Update
+
+```bash
+depintel update
+```
+
 ## Quick start
 
 Point depintel at any Maven project (single module or monorepo):

@@ -11,6 +11,12 @@ use crate::collector::{maven::CollectGoals, verbose_tree};
 use crate::graph::builder;
 use crate::output::color;
 
+/// Result indicating whether the audit found blocking findings.
+pub enum AuditOutcome {
+    Clean,
+    Blocking,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     pom_dir: &Path,
@@ -23,7 +29,7 @@ pub fn run(
     fix_plan_flag: bool,
     fresh: bool,
     offline: bool,
-) -> Result<()> {
+) -> Result<AuditOutcome> {
     if offline {
         anyhow::bail!(
             "audit requires network access to query OSV.dev — --offline is not supported yet."
@@ -123,13 +129,13 @@ pub fn run(
         }
     }
 
-    // CI gate: exit 2 if any HIGH or CRITICAL findings remain after filtering.
+    // CI gate: return Blocking if any HIGH or CRITICAL findings remain after filtering.
     let any_blocking = reports.iter().any(|r| r.summary.high > 0 || r.summary.critical > 0);
     if any_blocking {
-        std::process::exit(2);
+        return Ok(AuditOutcome::Blocking);
     }
 
-    Ok(())
+    Ok(AuditOutcome::Clean)
 }
 
 fn parse_severity(s: &str) -> Result<VulnSeverity> {
@@ -392,20 +398,25 @@ fn print_json(
     applicability: &Option<Vec<Vec<ApplicabilityResult>>>,
     plan: &Option<fix_plan::FixPlan>,
 ) -> Result<()> {
-    // Build a combined JSON output
-    let mut output = serde_json::json!({
+    // Always output a consistent JSON structure
+    let app_value = match applicability {
+        Some(app) => {
+            let flat: Vec<&ApplicabilityResult> = app.iter().flat_map(|r| r.iter()).collect();
+            serde_json::to_value(flat)?
+        }
+        None => serde_json::Value::Null,
+    };
+
+    let plan_value = match plan {
+        Some(p) => serde_json::to_value(p)?,
+        None => serde_json::Value::Null,
+    };
+
+    let output = serde_json::json!({
         "reports": reports,
+        "applicability": app_value,
+        "fix_plan": plan_value,
     });
-
-    if let Some(ref app) = applicability {
-        // Attach applicability results alongside findings
-        let app_flat: Vec<&ApplicabilityResult> = app.iter().flat_map(|r| r.iter()).collect();
-        output["applicability"] = serde_json::to_value(app_flat)?;
-    }
-
-    if let Some(ref p) = plan {
-        output["fix_plan"] = serde_json::to_value(p)?;
-    }
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
