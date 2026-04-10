@@ -111,27 +111,31 @@ pub fn analyze_fix_strategy(
 /// Search for a `<dependency>` block matching group:artifact where the version
 /// uses a property reference like `${some.property}`. Returns the property name.
 fn find_property_version(content: &str, group: &str, artifact: &str) -> Option<String> {
-    // Simple text-based search: find the dependency block, then check its version
     let lower = content.to_lowercase();
     let group_tag = format!("<groupid>{}</groupid>", group.to_lowercase());
     let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_lowercase());
 
+    // Find each <dependency>...</dependency> block and check if it matches
+    let dep_open = "<dependency>";
+    let dep_close = "</dependency>";
     let mut search_from = 0;
-    while let Some(gpos) = lower[search_from..].find(&group_tag) {
-        let abs_gpos = search_from + gpos;
-        // Look for the enclosing <dependency> block (within ~500 chars)
-        let block_start = if abs_gpos >= 500 { abs_gpos - 500 } else { 0 };
-        let block_end = (abs_gpos + 500).min(content.len());
-        let block = &lower[block_start..block_end];
+    while let Some(dstart) = lower[search_from..].find(dep_open) {
+        let abs_dstart = search_from + dstart;
+        let block_body_start = abs_dstart + dep_open.len();
+        let abs_dend = match lower[block_body_start..].find(dep_close) {
+            Some(e) => block_body_start + e,
+            None => break,
+        };
 
-        if block.contains(&artifact_tag) {
-            // Find <version>${...}</version> in this region
-            let region = &content[block_start..block_end];
-            if let Some(prop) = extract_property_ref(region) {
+        let block_lower = &lower[abs_dstart..abs_dend];
+        // Both groupId AND artifactId must be in this specific <dependency> block
+        if block_lower.contains(&group_tag) && block_lower.contains(&artifact_tag) {
+            let block_original = &content[abs_dstart..abs_dend];
+            if let Some(prop) = extract_property_ref(block_original) {
                 return Some(prop);
             }
         }
-        search_from = abs_gpos + group_tag.len();
+        search_from = abs_dend + dep_close.len();
     }
     None
 }
@@ -156,7 +160,6 @@ fn extract_property_ref(region: &str) -> Option<String> {
 /// Check if a POM has a direct `<dependency>` (not in `<dependencyManagement>`)
 /// for the given group:artifact.
 fn has_direct_dependency(content: &str, group: &str, artifact: &str) -> bool {
-    // Rough heuristic: find group+artifact outside of <dependencyManagement> blocks
     let lower = content.to_lowercase();
     let group_tag = format!("<groupid>{}</groupid>", group.to_lowercase());
     let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_lowercase());
@@ -165,24 +168,30 @@ fn has_direct_dependency(content: &str, group: &str, artifact: &str) -> bool {
     let mgmt_start = lower.find("<dependencymanagement>");
     let mgmt_end = lower.find("</dependencymanagement>");
 
+    let dep_open = "<dependency>";
+    let dep_close = "</dependency>";
     let mut search_from = 0;
-    while let Some(gpos) = lower[search_from..].find(&group_tag) {
-        let abs_gpos = search_from + gpos;
-        // Check if this position is inside dependencyManagement
+    while let Some(dstart) = lower[search_from..].find(dep_open) {
+        let abs_dstart = search_from + dstart;
+        let block_body_start = abs_dstart + dep_open.len();
+        let abs_dend = match lower[block_body_start..].find(dep_close) {
+            Some(e) => block_body_start + e,
+            None => break,
+        };
+
+        // Skip if inside dependencyManagement
         let in_mgmt = match (mgmt_start, mgmt_end) {
-            (Some(s), Some(e)) => abs_gpos > s && abs_gpos < e,
+            (Some(s), Some(e)) => abs_dstart > s && abs_dstart < e,
             _ => false,
         };
 
         if !in_mgmt {
-            // Check if artifact tag is nearby (within 200 chars)
-            let block_start = if abs_gpos >= 200 { abs_gpos - 200 } else { 0 };
-            let block_end = (abs_gpos + 200).min(lower.len());
-            if lower[block_start..block_end].contains(&artifact_tag) {
+            let block = &lower[abs_dstart..abs_dend];
+            if block.contains(&group_tag) && block.contains(&artifact_tag) {
                 return true;
             }
         }
-        search_from = abs_gpos + group_tag.len();
+        search_from = abs_dend + dep_close.len();
     }
     false
 }
@@ -259,6 +268,32 @@ mod tests {
         </project>
         "#;
         assert!(has_direct_dependency(pom, "com.google.guava", "guava"));
+    }
+
+    #[test]
+    fn test_find_property_version_picks_correct_artifact() {
+        // Regression: when multiple deps have property versions, the function
+        // must return the property belonging to the REQUESTED artifact, not
+        // whichever property appears first in the file.
+        let pom = r#"
+        <dependencies>
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-handler</artifactId>
+                <version>${netty.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.squareup.okhttp3</groupId>
+                <artifactId>okhttp</artifactId>
+                <version>${okhttp.version}</version>
+            </dependency>
+        </dependencies>
+        "#;
+        let prop = find_property_version(pom, "com.squareup.okhttp3", "okhttp");
+        assert_eq!(prop, Some("okhttp.version".to_string()));
+
+        let prop = find_property_version(pom, "io.netty", "netty-handler");
+        assert_eq!(prop, Some("netty.version".to_string()));
     }
 
     #[test]
