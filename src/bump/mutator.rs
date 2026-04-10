@@ -96,6 +96,11 @@ pub fn try_patch_in_place(
             target_version,
         )));
     }
+    // Check if a shared group property can be updated (e.g. ${netty.version}
+    // used by netty-handler when we're bumping netty-all).
+    if let Some(prop_range) = find_shared_group_property(content, group, &index.properties)? {
+        return Ok(Some(splice_ranges(content, &[prop_range], target_version)));
+    }
     Ok(None)
 }
 
@@ -206,6 +211,17 @@ pub fn mutate_pom_xml(
             &index.properties,
             target_version,
         ));
+    }
+
+    // Case 1.5: The target artifact isn't declared anywhere, but another artifact
+    // in the SAME groupId uses a `${property}` version. In Maven ecosystems like
+    // Netty, Jackson, etc., a shared property (e.g. `${netty.version}`) controls
+    // versions for ALL modules in the group. If we can find such a property AND
+    // the properties map has it, update the property instead of injecting a new
+    // dependencyManagement entry (which Maven would ignore because the property
+    // wins).
+    if let Some(prop_range) = find_shared_group_property(content, group, &index.properties)? {
+        return Ok(splice_ranges(content, &[prop_range], target_version));
     }
 
     // Case 2: dependencyManagement.dependencies exists → append new <dependency> entry.
@@ -439,6 +455,86 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
     }
 
     Ok(index)
+}
+
+/// When the target artifact (e.g. `io.netty:netty-all`) isn't declared in the POM,
+/// check if any OTHER artifact with the same groupId uses a `${property}` version.
+/// If that property exists in `<properties>`, return its byte range so the caller
+/// can splice it. This handles the common "shared version property" pattern
+/// (e.g. `${netty.version}` controlling netty-handler, netty-codec, etc.).
+fn find_shared_group_property(
+    content: &str,
+    group: &str,
+    properties: &HashMap<String, (usize, usize)>,
+) -> Result<Option<(usize, usize)>> {
+    if properties.is_empty() {
+        return Ok(None);
+    }
+    // Re-analyze the POM looking at ALL deps (not just the target artifact)
+    // to find any in the same group that use a property reference.
+    let mut reader = Reader::from_str(content);
+    reader.trim_text(false);
+    let mut stack = ElementStack::new();
+
+    struct DepScan {
+        group_id: Option<String>,
+        version_prop: Option<String>,
+    }
+    let mut current: Option<DepScan> = None;
+    let mut found_props: Vec<String> = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                stack.push(name.clone());
+                if classify_dep(&stack.elements).is_some() {
+                    current = Some(DepScan { group_id: None, version_prop: None });
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if name == "dependency" && classify_dep(&stack.elements).is_some() {
+                    if let Some(dep) = current.take() {
+                        if dep.group_id.as_deref() == Some(group) {
+                            if let Some(prop) = dep.version_prop {
+                                if properties.contains_key(&prop) && !found_props.contains(&prop) {
+                                    found_props.push(prop);
+                                }
+                            }
+                        }
+                    }
+                }
+                stack.pop();
+            }
+            Ok(Event::Text(t)) => {
+                if let Some(ref mut dep) = current {
+                    let text = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    let trimmed = text.trim().to_string();
+                    if !trimmed.is_empty() {
+                        if let Some(leaf) = stack.elements.last() {
+                            match leaf.as_str() {
+                                "groupId" => dep.group_id = Some(trimmed),
+                                "version" => dep.version_prop = parse_property_ref(&trimmed),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Return the first matching property's range
+    for prop in &found_props {
+        if let Some(range) = properties.get(prop) {
+            return Ok(Some(*range));
+        }
+    }
+    Ok(None)
 }
 
 /// If `s` is exactly `${name}`, return `name`.
@@ -712,6 +808,60 @@ mod tests {
         assert!(!out.contains("2.14.1"), "profile dep not updated:\n{}", out);
         assert!(out.contains("<version>2.17.2</version>"));
         assert!(!out.contains("<dependencyManagement>"), "should not inject depMgmt for profile dep:\n{}", out);
+    }
+
+    #[test]
+    fn shared_group_property_is_updated_for_sibling_artifact() {
+        // Regression: bumping `io.netty:netty-all` when the POM only declares
+        // `io.netty:netty-handler` with `${netty.version}`. The shared property
+        // should be updated even though netty-all is not explicitly listed.
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <properties><netty.version>4.1.129.Final</netty.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-handler</artifactId>
+      <version>${netty.version}</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let out = mutate_pom_xml(pom, "io.netty", "netty-all", "4.1.132.Final").unwrap();
+        assert!(
+            out.contains("<netty.version>4.1.132.Final</netty.version>"),
+            "shared property should be updated:\n{}", out
+        );
+        assert!(
+            !out.contains("4.1.129.Final"),
+            "old version should be gone:\n{}", out
+        );
+        // Should NOT inject a dependencyManagement entry since property update suffices
+        assert!(
+            !out.contains("<dependencyManagement>"),
+            "should not add depMgmt when property update covers it:\n{}", out
+        );
+    }
+
+    #[test]
+    fn try_patch_shared_group_property() {
+        // try_patch_in_place should also detect shared group properties
+        let pom = r#"<?xml version="1.0"?>
+<project>
+  <properties><netty.version>4.1.129.Final</netty.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-handler</artifactId>
+      <version>${netty.version}</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let result = try_patch_in_place(pom, "io.netty", "netty-all", "4.1.132.Final")
+            .unwrap();
+        assert!(result.is_some(), "should match via shared group property");
+        let out = result.unwrap();
+        assert!(out.contains("4.1.132.Final"));
+        assert!(!out.contains("4.1.129.Final"));
     }
 
     #[test]
