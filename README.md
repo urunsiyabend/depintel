@@ -257,7 +257,52 @@ depintel --pom-url https://github.com/apache/druid/tree/master/extensions-core/a
 
 ## CI integration
 
-Both `conflicts` and `audit` exit non-zero when they find something bad:
+### GitHub Actions
+
+```yaml
+- uses: urunsiyabend/depintel-action@v1
+  with:
+    command: audit
+    severity: high
+```
+
+```yaml
+- uses: urunsiyabend/depintel-action@v1
+  with:
+    command: conflicts
+    severity: high
+```
+
+```yaml
+- uses: urunsiyabend/depintel-action@v1
+  with:
+    command: bump
+    artifact: com.google.guava:guava
+    bump-to: 33.0-jre
+```
+
+See [depintel-action](https://github.com/urunsiyabend/depintel-action) for
+full input/output reference.
+
+### GitLab CI
+
+```yaml
+include:
+  - remote: 'https://raw.githubusercontent.com/urunsiyabend/depintel/main/ci/depintel.gitlab-ci.yml'
+
+depintel-audit:
+  extends: .depintel-audit
+
+depintel-conflicts:
+  extends: .depintel-conflicts
+  variables:
+    DEPINTEL_SEVERITY: "high"
+```
+
+See [`ci/depintel.gitlab-ci.yml`](ci/depintel.gitlab-ci.yml) for available
+templates and variables.
+
+### Exit codes
 
 | Exit | Meaning |
 |------|---------|
@@ -267,11 +312,14 @@ Both `conflicts` and `audit` exit non-zero when they find something bad:
 
 `bump` also returns exit code 2 on HIGH/CRITICAL risk.
 
-Example GitHub Actions step:
+### Direct usage
 
 ```yaml
+# GitHub Actions — without the action
 - name: Fail on HIGH/CRITICAL CVEs
-  run: depintel --pom . audit --severity high
+  run: |
+    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/urunsiyabend/depintel/releases/latest/download/depintel-installer.sh | sh
+    depintel --pom . audit --severity high
 ```
 
 JSON output is stable and suitable for piping:

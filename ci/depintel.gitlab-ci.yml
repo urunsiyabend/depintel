@@ -1,0 +1,79 @@
+# depintel GitLab CI template
+#
+# Include in your .gitlab-ci.yml:
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/urunsiyabend/depintel/main/ci/depintel.gitlab-ci.yml'
+#
+#   depintel-audit:
+#     extends: .depintel-audit
+#
+#   depintel-conflicts:
+#     extends: .depintel-conflicts
+#     variables:
+#       DEPINTEL_SEVERITY: "high"
+
+.depintel-base:
+  image: maven:3-eclipse-temurin-17
+  variables:
+    DEPINTEL_VERSION: "latest"
+    DEPINTEL_POM: "."
+    DEPINTEL_SEVERITY: ""
+    DEPINTEL_MODULE: ""
+    DEPINTEL_OUTPUT: "text"
+  before_script:
+    - |
+      VERSION="$DEPINTEL_VERSION"
+      if [ "$VERSION" = "latest" ]; then
+        apt-get update -qq && apt-get install -y -qq jq curl > /dev/null 2>&1
+        VERSION=$(curl -s https://api.github.com/repos/urunsiyabend/depintel/releases/latest | jq -r '.tag_name')
+      fi
+      curl --proto '=https' --tlsv1.2 -LsSf \
+        "https://github.com/urunsiyabend/depintel/releases/download/${VERSION}/depintel-installer.sh" | sh
+      export PATH="$HOME/.cargo/bin:$PATH"
+
+.depintel-audit:
+  extends: .depintel-base
+  stage: test
+  script:
+    - |
+      CMD="depintel --pom $DEPINTEL_POM --output $DEPINTEL_OUTPUT --no-color audit"
+      [ -n "$DEPINTEL_SEVERITY" ] && CMD="$CMD --severity $DEPINTEL_SEVERITY"
+      [ -n "$DEPINTEL_MODULE" ] && CMD="$CMD --module $DEPINTEL_MODULE"
+      eval $CMD
+  allow_failure:
+    exit_codes:
+      - 2
+
+.depintel-conflicts:
+  extends: .depintel-base
+  stage: test
+  script:
+    - |
+      CMD="depintel --pom $DEPINTEL_POM --output $DEPINTEL_OUTPUT --no-color conflicts"
+      [ -n "$DEPINTEL_SEVERITY" ] && CMD="$CMD --severity $DEPINTEL_SEVERITY"
+      [ -n "$DEPINTEL_MODULE" ] && CMD="$CMD --module $DEPINTEL_MODULE"
+      eval $CMD
+  allow_failure:
+    exit_codes:
+      - 2
+
+.depintel-audit-json:
+  extends: .depintel-base
+  stage: test
+  variables:
+    DEPINTEL_OUTPUT: "json"
+  script:
+    - |
+      CMD="depintel --pom $DEPINTEL_POM --output json --no-color audit"
+      [ -n "$DEPINTEL_SEVERITY" ] && CMD="$CMD --severity $DEPINTEL_SEVERITY"
+      [ -n "$DEPINTEL_MODULE" ] && CMD="$CMD --module $DEPINTEL_MODULE"
+      eval $CMD | tee depintel-audit.json
+  artifacts:
+    paths:
+      - depintel-audit.json
+    when: always
+    expire_in: 30 days
+  allow_failure:
+    exit_codes:
+      - 2
