@@ -1,6 +1,17 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// Optional `settings.xml` forwarded to every Maven invocation as `-s <path>`.
+/// Set once from the global `--settings` CLI flag before any command runs.
+static MVN_SETTINGS: OnceLock<PathBuf> = OnceLock::new();
+
+/// Register a Maven settings file to pass through to all Maven invocations.
+/// Call before running any collection command.
+pub fn set_mvn_settings(path: PathBuf) {
+    let _ = MVN_SETTINGS.set(path);
+}
 
 /// Output from running all Maven collection commands.
 pub struct MavenOutput {
@@ -12,7 +23,8 @@ pub struct MavenOutput {
 /// Discover the Maven executable to use for a given project directory.
 ///
 /// Priority order:
-/// 1. Project-local Maven wrapper: `mvnw.cmd` / `mvnw` in pom_dir (walks up to root)
+/// 1. Project-local Maven wrapper in pom_dir (walks up to root): `mvnw` on Unix,
+///    `mvnw.cmd` then `mvnw` on Windows (the `.cmd` script is not executable on Unix)
 /// 2. `mvn` / `mvn.cmd` on PATH
 /// 3. Well-known installation locations:
 ///    - JetBrains IDEs (IntelliJ IDEA, IntelliJ IDEA CE)
@@ -22,8 +34,15 @@ pub struct MavenOutput {
 ///
 /// Returns the full path to the executable.
 pub fn discover_mvn(pom_dir: &Path) -> Result<PathBuf> {
-    // 0. mvnd (Maven Daemon) — fastest option, check first
-    for daemon_name in &["mvnd.cmd", "mvnd"] {
+    // 0. mvnd (Maven Daemon) — fastest option, check first.
+    // On Unix the `.cmd` wrapper is a Windows batch file and is never executable,
+    // so only consider it on Windows.
+    let daemon_names: &[&str] = if cfg!(windows) {
+        &["mvnd.cmd", "mvnd"]
+    } else {
+        &["mvnd"]
+    };
+    for daemon_name in daemon_names {
         // Check in project dir (mvndw equivalent)
         let mut dir = pom_dir.to_path_buf();
         loop {
@@ -45,10 +64,17 @@ pub fn discover_mvn(pom_dir: &Path) -> Result<PathBuf> {
         }
     }
 
-    // 1. Walk up from pom_dir looking for mvnw / mvnw.cmd
+    // 1. Walk up from pom_dir looking for mvnw / mvnw.cmd.
+    // On Unix the `.cmd` wrapper is a Windows batch file (not executable), so prefer
+    // the POSIX `mvnw` script and only fall back to `.cmd` on Windows.
+    let wrapper_names: &[&str] = if cfg!(windows) {
+        &["mvnw.cmd", "mvnw"]
+    } else {
+        &["mvnw"]
+    };
     let mut dir = pom_dir.to_path_buf();
     loop {
-        for name in &["mvnw.cmd", "mvnw"] {
+        for name in wrapper_names {
             let wrapper = dir.join(name);
             if wrapper.exists() {
                 eprintln!("Found Maven wrapper: {}", wrapper.display());
@@ -396,7 +422,16 @@ fn run_mvn(mvn: &Path, pom_dir: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .arg("-B"); // batch mode, non-interactive
 
-    eprintln!("Running: {} {} -B", mvn.display(), args.join(" "));
+    // Forward a user-supplied settings.xml if one was registered via --settings.
+    if let Some(settings) = MVN_SETTINGS.get() {
+        cmd.arg("-s").arg(settings);
+    }
+
+    let settings_note = MVN_SETTINGS
+        .get()
+        .map(|s| format!(" -s {}", s.display()))
+        .unwrap_or_default();
+    eprintln!("Running: {} {} -B{}", mvn.display(), args.join(" "), settings_note);
 
     let output = cmd.output()
         .with_context(|| format!("Failed to execute {}", mvn.display()))?;

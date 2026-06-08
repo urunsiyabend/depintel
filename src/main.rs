@@ -50,6 +50,10 @@ struct Cli {
     /// Show additional detail
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// Path to a Maven settings.xml to forward to every Maven invocation (-s)
+    #[arg(long, short = 's', global = true)]
+    settings: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -135,6 +139,10 @@ fn main() {
 
     if cli.no_color {
         output::color::disable_color();
+    }
+
+    if let Some(settings) = cli.settings.clone() {
+        collector::maven::set_mvn_settings(settings);
     }
 
     match run(cli) {
