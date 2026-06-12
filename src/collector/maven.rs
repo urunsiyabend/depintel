@@ -9,8 +9,29 @@ static MVN_SETTINGS: OnceLock<PathBuf> = OnceLock::new();
 
 /// Register a Maven settings file to pass through to all Maven invocations.
 /// Call before running any collection command.
+///
+/// The path is resolved to an absolute path against the current working
+/// directory *now*, before any Maven goal runs. This matters because
+/// [`run_mvn`] executes Maven with `current_dir(pom_dir)`; a relative `-s`
+/// value would otherwise be resolved by Maven against the project directory
+/// instead of the directory the user launched depintel from, producing errors
+/// like "The specified user settings file does not exist: <pom_dir>/<path>".
 pub fn set_mvn_settings(path: PathBuf) {
-    let _ = MVN_SETTINGS.set(path);
+    let abs = match std::env::current_dir() {
+        Ok(cwd) => absolutize_settings(path, &cwd),
+        Err(_) => path,
+    };
+    let _ = MVN_SETTINGS.set(abs);
+}
+
+/// Resolve a settings path to an absolute path against `cwd`. Absolute paths
+/// pass through unchanged.
+fn absolutize_settings(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// Output from running all Maven collection commands.
@@ -472,5 +493,29 @@ pub fn resolve_pom_dir(pom_path: &Path) -> Result<PathBuf> {
             .unwrap_or_else(|| PathBuf::from(".")))
     } else {
         bail!("Path does not exist: {}", pom_path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_settings_resolve_against_launch_cwd_not_pom_dir() {
+        // Regression: a relative `-s` path must be resolved against the
+        // directory depintel was launched from, NOT the pom_dir that run_mvn
+        // later cd's into. Otherwise Maven reports
+        // "settings file does not exist: <pom_dir>/<path>".
+        let cwd = Path::new("/home/user/launch");
+        let resolved = absolutize_settings(PathBuf::from("settings2.xml"), cwd);
+        assert_eq!(resolved, PathBuf::from("/home/user/launch/settings2.xml"));
+    }
+
+    #[test]
+    fn absolute_settings_pass_through_unchanged() {
+        let cwd = Path::new("/home/user/launch");
+        let abs = PathBuf::from("/abs/path/settings2.xml");
+        let resolved = absolutize_settings(abs.clone(), cwd);
+        assert_eq!(resolved, abs);
     }
 }
