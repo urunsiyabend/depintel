@@ -198,77 +198,68 @@ fn strip_tree_chars(line: &str) -> &str {
 }
 
 fn parse_status_and_managed(s: &str) -> (&str, NodeStatus, Option<String>) {
-    let mut artifact_part = s;
-    let mut status = NodeStatus::Selected;
-    let mut managed_from = None;
-
-    // Maven verbose tree formats:
+    // Maven verbose tree formats. Annotations after the coordinates are joined
+    // by " - " for the first one and "; " for subsequent ones, so the same omit
+    // reason can be preceded by either separator:
     //   artifact:coords:scope (version managed from X.Y.Z)
     //   artifact:coords:scope (version managed from X.Y.Z; scope not updated to compile)
     //   artifact:coords:scope (managed from X.Y.Z)
-    //   (artifact:coords:scope - version managed from X.Y.Z; omitted for duplicate)
     //   (artifact:coords:scope - omitted for conflict with X.Y.Z)
     //   (artifact:coords:scope - omitted for duplicate)
+    //   (artifact:coords:scope - version managed from A; omitted for duplicate)
+    //   (artifact:coords:scope - version managed from A; omitted for conflict with X.Y.Z)
+    //   (artifact:coords:scope - scope updated from runtime; omitted for conflict with X.Y.Z)
 
-    // Extract "managed from" version from any parenthesized suffix
-    // Look for both "managed from " and "version managed from "
+    // Selected node with a trailing parenthesized "(... managed from X)" group.
     for pattern in &["(version managed from ", "(managed from "] {
         if let Some(idx) = s.rfind(pattern) {
-            let after_pattern = &s[idx + pattern.len()..];
-            // Version ends at ';' or ')'
-            let version_end = after_pattern
-                .find(|c| c == ';' || c == ')')
-                .unwrap_or(after_pattern.len());
-            managed_from = Some(after_pattern[..version_end].trim().to_string());
-            artifact_part = s[..idx].trim();
-            break;
+            let managed_from = Some(extract_until_delim(&s[idx + pattern.len()..]));
+            return (s[..idx].trim(), NodeStatus::Selected, managed_from);
         }
     }
 
-    // Check for parenthesized omitted entry: starts with '('
-    if artifact_part.starts_with('(') {
-        let inner = if artifact_part.ends_with(')') {
-            &artifact_part[1..artifact_part.len() - 1]
-        } else {
-            &artifact_part[1..]
+    // Parenthesized omitted entry: "(coords:scope - <annotations>)".
+    if let Some(stripped) = s.strip_prefix('(') {
+        let inner = stripped.strip_suffix(')').unwrap_or(stripped);
+
+        // Coordinates are everything before the first annotation (" - ").
+        let artifact_part = match inner.find(" - ") {
+            Some(i) => &inner[..i],
+            None => inner,
         };
 
-        // Look for " - omitted for conflict with X.Y.Z"
-        if let Some(idx) = inner.find(" - omitted for conflict with ") {
-            let winning = &inner[idx + " - omitted for conflict with ".len()..];
-            let winning = winning.trim_end_matches(')');
-            status = NodeStatus::OmittedForConflict {
-                winning_version: winning.to_string(),
-            };
-            artifact_part = &inner[..idx];
-        }
-        // Look for " - version managed from X; omitted for duplicate"
-        else if let Some(idx) = inner.find("; omitted for duplicate") {
-            status = NodeStatus::OmittedForDuplicate;
-            // artifact part might have " - version managed from X" before the semicolon
-            let before_semi = &inner[..idx];
-            if let Some(dash_idx) = before_semi.find(" - version managed from ") {
-                let ver = &before_semi[dash_idx + " - version managed from ".len()..];
-                managed_from = Some(ver.trim().to_string());
-                artifact_part = &before_semi[..dash_idx];
-            } else if let Some(dash_idx) = before_semi.find(" - ") {
-                artifact_part = &before_semi[..dash_idx];
-            } else {
-                artifact_part = before_semi;
+        // Pull an inline "managed from X" out of the annotation block, if present.
+        let mut managed_from = None;
+        for pattern in &["version managed from ", "managed from "] {
+            if let Some(idx) = inner.find(pattern) {
+                managed_from = Some(extract_until_delim(&inner[idx + pattern.len()..]));
+                break;
             }
         }
-        // Look for " - omitted for duplicate"
-        else if let Some(idx) = inner.find(" - omitted for duplicate") {
-            status = NodeStatus::OmittedForDuplicate;
-            artifact_part = &inner[..idx];
-        }
-        // Parenthesized but unknown reason
-        else {
-            artifact_part = inner;
-        }
+
+        // Match the omit reason by phrase, independent of the " - " / "; " separator.
+        let status = if let Some(idx) = inner.find("omitted for conflict with ") {
+            let winning = extract_until_delim(&inner[idx + "omitted for conflict with ".len()..]);
+            NodeStatus::OmittedForConflict {
+                winning_version: winning,
+            }
+        } else if inner.contains("omitted for duplicate") {
+            NodeStatus::OmittedForDuplicate
+        } else {
+            NodeStatus::Selected
+        };
+
+        return (artifact_part, status, managed_from);
     }
 
-    (artifact_part, status, managed_from)
+    (s, NodeStatus::Selected, None)
+}
+
+/// Read a value from the start of `s` up to the next ';' or ')' delimiter,
+/// trimmed. Used to pull a version/scope token out of a Maven annotation.
+fn extract_until_delim(s: &str) -> String {
+    let end = s.find(|c| c == ';' || c == ')').unwrap_or(s.len());
+    s[..end].trim().to_string()
 }
 
 fn parse_coordinates(s: &str) -> Option<Artifact> {
@@ -394,6 +385,43 @@ mod tests {
         assert_eq!(
             artifact_part,
             "org.springframework.boot:spring-boot:jar:3.3.2:compile"
+        );
+    }
+
+    #[test]
+    fn test_parse_conflict_with_managed_annotation_semicolon_separator() {
+        // When a node carries a "version managed from" annotation, the omit
+        // reason is joined with "; " instead of " - ". Both the conflict status
+        // and the winning version must still be parsed.
+        let input =
+            "(org.apache.commons:commons-lang3:jar:3.17.0:compile - version managed from 3.16.0; omitted for conflict with 3.18.0)";
+        let (artifact_part, status, managed) = parse_status_and_managed(input);
+
+        assert!(matches!(
+            status,
+            NodeStatus::OmittedForConflict { winning_version } if winning_version == "3.18.0"
+        ));
+        assert_eq!(managed, Some("3.16.0".to_string()));
+        assert_eq!(
+            artifact_part,
+            "org.apache.commons:commons-lang3:jar:3.17.0:compile"
+        );
+    }
+
+    #[test]
+    fn test_parse_conflict_with_scope_annotation_semicolon_separator() {
+        let input =
+            "(org.apache.commons:commons-lang3:jar:3.17.0:compile - scope updated from runtime; omitted for conflict with 3.18.0)";
+        let (artifact_part, status, managed) = parse_status_and_managed(input);
+
+        assert!(matches!(
+            status,
+            NodeStatus::OmittedForConflict { winning_version } if winning_version == "3.18.0"
+        ));
+        assert_eq!(managed, None);
+        assert_eq!(
+            artifact_part,
+            "org.apache.commons:commons-lang3:jar:3.17.0:compile"
         );
     }
 
