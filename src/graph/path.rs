@@ -640,6 +640,49 @@ mod tests {
     }
 
     #[test]
+    fn test_why_direct_pin_wins_over_transitive_conflict() {
+        // A direct <dependency> pin overrides versions requested transitively.
+        // Maven marks the transitive requests "omitted for conflict with <pin>";
+        // the pin must be reported as selected regardless of tree order.
+        let input = r#"com.example:app:jar:1.0.0
++- org.apache.commons:commons-lang3:jar:3.18.0:compile
++- org.apache.hive:hive-common:jar:3.1.3:compile
+|  \- (org.apache.commons:commons-lang3:jar:3.17.0:compile - omitted for conflict with 3.18.0)"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let key = ArtifactKey::new("org.apache.commons", "commons-lang3");
+        let result = why_artifact(&graph, &key, &default_opts()).unwrap();
+        assert_eq!(result.selected_version.as_deref(), Some("3.18.0"));
+    }
+
+    #[test]
+    fn test_why_direct_pin_wins_when_losers_annotated_and_listed_first() {
+        // Regression for #3: transitive losers carrying a "version managed from"/
+        // "scope updated from" annotation are joined to "omitted for conflict" with
+        // a ';' separator. When such losers appear BEFORE the direct pin (pin
+        // declared last in the pom), they were mis-parsed as Selected and the
+        // first-selected lookup returned the transitive version (3.17.0),
+        // producing false-positive CVE findings against the already-pinned artifact.
+        let input = r#"com.example:app:jar:1.0.0
++- org.apache.hive:hive-common:jar:3.1.3:compile
+|  \- (org.apache.commons:commons-lang3:jar:3.17.0:compile - version managed from 3.16.0; omitted for conflict with 3.18.0)
++- com.opencsv:opencsv:jar:5.9:compile
+|  \- (org.apache.commons:commons-lang3:jar:3.17.0:compile - scope updated from runtime; omitted for conflict with 3.18.0)
++- org.apache.commons:commons-lang3:jar:3.18.0:compile"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let key = ArtifactKey::new("org.apache.commons", "commons-lang3");
+        let result = why_artifact(&graph, &key, &default_opts()).unwrap();
+        assert_eq!(result.selected_version.as_deref(), Some("3.18.0"));
+        // The transitive 3.17.0 requests must be losers, not selected.
+        for r in &result.requests {
+            if r.version == "3.17.0" {
+                assert!(!r.selected, "transitive 3.17.0 must not be selected");
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_semver() {
         assert_eq!(parse_semver("2.15.3"), (2, 15, 3));
         assert_eq!(parse_semver("1.7.36"), (1, 7, 36));
