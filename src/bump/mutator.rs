@@ -19,7 +19,11 @@ use std::path::{Path, PathBuf};
 struct VersionSite {
     range: (usize, usize),
     property_ref: Option<String>,
+    profile: Option<usize>,
 }
+
+// Identify a profile by its opening tag's byte position, not its user-supplied id.
+type PropertyRanges = HashMap<(Option<usize>, String), (usize, usize)>;
 
 /// Result of analyzing an existing pom.xml for entries we may need to touch.
 #[derive(Debug)]
@@ -38,8 +42,8 @@ struct PomIndex {
     existing_mgmt: Vec<VersionSite>,
     /// Version sites for direct entries (at project-level OR inside a `<profile>`).
     existing_direct: Vec<VersionSite>,
-    /// property-name -> (text range) for entries defined under `<project><properties>`.
-    properties: HashMap<String, (usize, usize)>,
+    /// (profile scope, property-name) -> text range; None is project-level.
+    properties: PropertyRanges,
 }
 
 #[derive(Clone)]
@@ -230,7 +234,9 @@ pub fn mutate_pom_xml(
     if let Some(splice_at) = index.dep_mgmt_deps_close_start {
         let insertion = format!(
             "    <dependency>\n      <groupId>{}</groupId>\n      <artifactId>{}</artifactId>\n      <version>{}</version>\n    </dependency>\n  ",
-            group, artifact, target_version
+            quick_xml::escape::escape(group),
+            quick_xml::escape::escape(artifact),
+            quick_xml::escape::escape(target_version)
         );
         let mut out = String::with_capacity(content.len() + insertion.len());
         out.push_str(&content[..splice_at]);
@@ -243,7 +249,9 @@ pub fn mutate_pom_xml(
     if let Some(splice_at) = index.dep_mgmt_close_start {
         let insertion = format!(
             "    <dependencies>\n      <dependency>\n        <groupId>{}</groupId>\n        <artifactId>{}</artifactId>\n        <version>{}</version>\n      </dependency>\n    </dependencies>\n  ",
-            group, artifact, target_version
+            quick_xml::escape::escape(group),
+            quick_xml::escape::escape(artifact),
+            quick_xml::escape::escape(target_version)
         );
         let mut out = String::with_capacity(content.len() + insertion.len());
         out.push_str(&content[..splice_at]);
@@ -256,7 +264,9 @@ pub fn mutate_pom_xml(
     if let Some(splice_at) = index.project_close_start {
         let insertion = format!(
             "  <dependencyManagement>\n    <dependencies>\n      <dependency>\n        <groupId>{}</groupId>\n        <artifactId>{}</artifactId>\n        <version>{}</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>\n",
-            group, artifact, target_version
+            quick_xml::escape::escape(group),
+            quick_xml::escape::escape(artifact),
+            quick_xml::escape::escape(target_version)
         );
         let mut out = String::with_capacity(content.len() + insertion.len());
         out.push_str(&content[..splice_at]);
@@ -270,7 +280,9 @@ pub fn mutate_pom_xml(
     if let Some(splice_at) = index.project_open_end {
         let insertion = format!(
             "\n  <dependencyManagement>\n    <dependencies>\n      <dependency>\n        <groupId>{}</groupId>\n        <artifactId>{}</artifactId>\n        <version>{}</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>\n",
-            group, artifact, target_version
+            quick_xml::escape::escape(group),
+            quick_xml::escape::escape(artifact),
+            quick_xml::escape::escape(target_version)
         );
         let mut out = String::with_capacity(content.len() + insertion.len());
         out.push_str(&content[..splice_at]);
@@ -340,6 +352,7 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
         version_site: Option<VersionSite>,
     }
     let mut current_dep: Option<CurrentDep> = None;
+    let mut profile = None;
 
     let mut prev_pos: usize = 0;
 
@@ -355,6 +368,10 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                 }
 
                 stack.push(name.clone());
+
+                if stack.elements == ["project", "profiles", "profile"] {
+                    profile = Some(reader.buffer_position() as usize);
+                }
 
                 if let Some(kind) = classify_dep(&stack.elements) {
                     current_dep = Some(CurrentDep {
@@ -434,6 +451,9 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                     index.project_close_start = Some(pos_of_close_open);
                 }
 
+                if stack.elements == ["project", "profiles", "profile"] {
+                    profile = None;
+                }
                 stack.pop();
             }
             Ok(Event::Text(t)) => {
@@ -462,6 +482,7 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                                     dep.version_site = Some(VersionSite {
                                         range,
                                         property_ref: prop,
+                                        profile,
                                     });
                                 }
                                 _ => {}
@@ -470,12 +491,12 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                     }
                 }
 
-                // --- 2. <project><properties><NAME> text capture ---
-                // stack tail = [..., "project", "properties", NAME]
+                // --- 2. Root or profile <properties><NAME> text capture ---
                 if stack.elements.len() >= 3 && !trimmed.is_empty() {
                     let n = stack.elements.len();
                     if stack.elements[n - 2] == "properties"
-                        && stack.elements.get(n - 3).map(String::as_str) == Some("project")
+                        && (n == 3 && stack.elements[0] == "project"
+                            || n == 5 && profile.is_some() && stack.elements[n - 3] == "profile")
                     {
                         let name = stack.elements[n - 1].clone();
                         let end = reader.buffer_position() as usize;
@@ -484,7 +505,7 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                         let (off_start, off_end) = trim_offsets(raw);
                         index
                             .properties
-                            .entry(name)
+                            .entry((profile, name))
                             .or_insert((start + off_start, start + off_end));
                     }
                 }
@@ -510,7 +531,7 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
 fn find_shared_group_property(
     content: &str,
     group: &str,
-    properties: &HashMap<String, (usize, usize)>,
+    properties: &PropertyRanges,
 ) -> Result<Option<(usize, usize)>> {
     if properties.is_empty() {
         return Ok(None);
@@ -526,13 +547,17 @@ fn find_shared_group_property(
         version_prop: Option<String>,
     }
     let mut current: Option<DepScan> = None;
-    let mut found_props: Vec<String> = Vec::new();
+    let mut found_props: Vec<(usize, usize)> = Vec::new();
+    let mut profile = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 stack.push(name.clone());
+                if stack.elements == ["project", "profiles", "profile"] {
+                    profile = Some(reader.buffer_position() as usize);
+                }
                 if classify_dep(&stack.elements).is_some() {
                     current = Some(DepScan {
                         group_id: None,
@@ -546,12 +571,17 @@ fn find_shared_group_property(
                     if let Some(dep) = current.take() {
                         if dep.group_id.as_deref() == Some(group) {
                             if let Some(prop) = dep.version_prop {
-                                if properties.contains_key(&prop) && !found_props.contains(&prop) {
-                                    found_props.push(prop);
+                                if let Some(range) = property_range(properties, profile, &prop) {
+                                    if !found_props.contains(&range) {
+                                        found_props.push(range);
+                                    }
                                 }
                             }
                         }
                     }
+                }
+                if stack.elements == ["project", "profiles", "profile"] {
+                    profile = None;
                 }
                 stack.pop();
             }
@@ -576,13 +606,19 @@ fn find_shared_group_property(
         }
     }
 
-    // Return the first matching property's range
-    for prop in &found_props {
-        if let Some(range) = properties.get(prop) {
-            return Ok(Some(*range));
-        }
-    }
-    Ok(None)
+    // Return the first matching property's range.
+    Ok(found_props.first().copied())
+}
+
+fn property_range(
+    properties: &PropertyRanges,
+    profile: Option<usize>,
+    name: &str,
+) -> Option<(usize, usize)> {
+    properties
+        .get(&(profile, name.to_string()))
+        .or_else(|| properties.get(&(None, name.to_string())))
+        .copied()
 }
 
 /// If `s` is exactly `${name}`, return `name`.
@@ -607,9 +643,10 @@ fn splice_ranges(content: &str, ranges: &[(usize, usize)], replacement: &str) ->
             dedup.push(r);
         }
     }
+    let replacement = quick_xml::escape::escape(replacement);
     let mut out = content.to_string();
     for (start, end) in dedup {
-        out.replace_range(start..end, replacement);
+        out.replace_range(start..end, &replacement);
     }
     out
 }
@@ -620,15 +657,15 @@ fn splice_ranges(content: &str, ranges: &[(usize, usize)], replacement: &str) ->
 fn splice_sites(
     content: &str,
     sites: &[VersionSite],
-    properties: &HashMap<String, (usize, usize)>,
+    properties: &PropertyRanges,
     replacement: &str,
 ) -> String {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for s in sites {
         match &s.property_ref {
             Some(name) => {
-                if let Some(r) = properties.get(name) {
-                    ranges.push(*r);
+                if let Some(r) = property_range(properties, s.profile, name) {
+                    ranges.push(r);
                 } else {
                     // Placeholder with no matching property definition — fall
                     // back to patching the placeholder literal so Maven at
@@ -730,6 +767,98 @@ mod tests {
     </dependencyManagement>
 </project>
 "#;
+
+    #[test]
+    fn profile_version_property_updates_its_own_definition() {
+        let pom = r#"<project>
+  <properties><v>1.0</v></properties>
+  <profiles>
+    <profile><id>target</id>
+      <dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency></dependencies>
+      <!-- Local properties can follow dependency declarations. -->
+      <properties><v> 2.0 </v></properties>
+    </profile>
+    <profile><id>unrelated</id>
+      <properties><v>3.0</v></properties>
+      <dependencies><dependency><groupId>other</groupId><artifactId>a</artifactId><version>${v}</version></dependency></dependencies>
+    </profile>
+  </profiles>
+</project>"#;
+        let expected = pom.replace(" 2.0 ", " 4.0 ");
+        assert_eq!(mutate_pom_xml(pom, "g", "a", "4.0").unwrap(), expected);
+        assert_eq!(
+            try_patch_in_place(pom, "g", "a", "4.0").unwrap(),
+            Some(expected)
+        );
+        // Shared-group property lookup must obey the same profile scope.
+        let expected = pom.replace(" 2.0 ", " 4.0 ");
+        assert_eq!(
+            mutate_pom_xml(pom, "g", "sibling", "4.0").unwrap(),
+            expected
+        );
+        assert_eq!(
+            try_patch_in_place(pom, "g", "sibling", "4.0").unwrap(),
+            Some(expected)
+        );
+        // Without a local override, a profile still inherits the root property.
+        let inherited = pom.replace("<properties><v> 2.0 </v></properties>", "");
+        assert_eq!(
+            mutate_pom_xml(&inherited, "g", "a", "4.0").unwrap(),
+            inherited.replace("<v>1.0</v>", "<v>4.0</v>")
+        );
+    }
+
+    #[test]
+    fn mutation_escapes_xml_text_without_changing_values() {
+        let version = "2&preview<3>";
+        let escaped_version = "2&amp;preview&lt;3&gt;";
+        let direct = "<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency></dependencies></project>";
+        let property = "<project><properties><v>1</v></properties><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency></dependencies></project>";
+        let sibling = property.replace(
+            "<artifactId>a</artifactId>",
+            "<artifactId>sibling</artifactId>",
+        );
+        for pom in [direct, property, &sibling] {
+            let out = mutate_pom_xml(pom, "g", "a", version).unwrap();
+            assert_eq!(out, pom.replace(">1<", &format!(">{escaped_version}<")));
+            assert_eq!(
+                try_patch_in_place(pom, "g", "a", version).unwrap(),
+                Some(out)
+            );
+        }
+        for management in [
+            "",
+            "<dependencyManagement/>",
+            "<dependencyManagement></dependencyManagement>",
+            "<dependencyManagement><dependencies/></dependencyManagement>",
+        ] {
+            let pom = format!("<project><!-- preserve -->{management}</project>");
+            let out = mutate_pom_xml(&pom, "g&co", "a<lib>", version).unwrap();
+            assert!(out.contains("<groupId>g&amp;co</groupId>"), "{out}");
+            assert!(
+                out.contains("<artifactId>a&lt;lib&gt;</artifactId>"),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!("<version>{escaped_version}</version>")),
+                "{out}"
+            );
+            assert_eq!(
+                mutate_pom_xml(&out, "g&co", "a<lib>", version).unwrap(),
+                out
+            );
+            let mut reader = Reader::from_str(&out);
+            loop {
+                match reader.read_event().unwrap() {
+                    Event::Text(text) => {
+                        text.unescape().unwrap();
+                    }
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 
     #[test]
     fn direct_dependency_version_is_patched_in_place() {

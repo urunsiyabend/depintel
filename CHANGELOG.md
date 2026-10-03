@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.8
+
+Backward-compatible bug fixes; commands and serialized schemas are unchanged.
+
+### Fixed
+
+- Compare numeric version components when breaking fix-plan candidate ties, so 2.10 ranks above 2.9.
+- Escape XML text when inserting or replacing Maven coordinates and versions.
+- Update profile-local version properties instead of unrelated root definitions; preserve root inheritance when no local override exists.
+- Preserve selected version, scope and resolution metadata when `why --depth` filters displayed paths.
+- Prevent reconstructed duplicate subtrees from revisiting real ancestors and inventing cyclic paths.
+
+### Tests
+
+- Add five RED/GREEN regression tests; the complete suite now contains 114 passing tests.
+
 ## 0.1.7
 
 Backward-compatible bug fixes; no new commands or breaking interface changes.

@@ -81,7 +81,11 @@ fn classify_status(req: &VersionRequest, selected_version: Option<&str>) -> &'st
 }
 
 /// Run a "why" query against a single module's graph.
-pub fn why_artifact(graph: &DepGraph, key: &ArtifactKey, options: &WhyOptions) -> Option<WhyResult> {
+pub fn why_artifact(
+    graph: &DepGraph,
+    key: &ArtifactKey,
+    options: &WhyOptions,
+) -> Option<WhyResult> {
     let requests = graph.get_requests(key)?;
     if requests.is_empty() {
         return None;
@@ -102,8 +106,8 @@ pub fn why_artifact(graph: &DepGraph, key: &ArtifactKey, options: &WhyOptions) -
         return None;
     }
 
-    // Find the selected version
-    let selected = filtered_requests.iter().find(|r| r.selected);
+    // Depth limits affect displayed paths, not Maven's resolution of the artifact.
+    let selected = requests.iter().find(|r| r.selected);
     let selected_version = selected.map(|r| r.version.clone());
     let selected_scope = selected.map(|r| {
         if let Some(idx) = graph.find_node_versioned(key, &r.version) {
@@ -115,7 +119,7 @@ pub fn why_artifact(graph: &DepGraph, key: &ArtifactKey, options: &WhyOptions) -
 
     // Determine resolution reason (using effective-pom managed deps for BOM detection)
     let resolution = determine_resolution(
-        &filtered_requests,
+        requests,
         selected_version.as_deref(),
         key,
         &options.managed_deps,
@@ -292,7 +296,13 @@ fn find_management_source(
     if let Some(bom) = bom_imports.iter().find(|b| {
         // Check if the artifact group starts with the BOM's group prefix
         // e.g., org.springframework.boot BOM manages org.springframework.* deps
-        let bom_prefix = b.key.group_id.split('.').take(2).collect::<Vec<_>>().join(".");
+        let bom_prefix = b
+            .key
+            .group_id
+            .split('.')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(".");
         key.group_id.starts_with(&bom_prefix)
     }) {
         return Some(ResolutionSource {
@@ -390,7 +400,10 @@ fn generate_warnings(
             consumer: key.to_string(),
             compiled_against: String::new(),
             resolved_to: String::new(),
-            description: format!("Artifact appears in multiple scopes: {}", scope_list.join(", ")),
+            description: format!(
+                "Artifact appears in multiple scopes: {}",
+                scope_list.join(", ")
+            ),
         });
     }
 
@@ -488,7 +501,10 @@ mod tests {
         let src = result.resolution.source.as_ref().unwrap();
         assert_eq!(src.source_type, "path_depth");
         assert_eq!(result.requests.len(), 2);
-        assert!(result.warnings.iter().any(|w| w.warning_type == "version_gap"));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.warning_type == "version_gap"));
     }
 
     #[test]
@@ -577,13 +593,47 @@ mod tests {
         // All are version 9.6 — no overridden, only selected + duplicates
         for req in &result.requests {
             let status = request_status_label(req, result.selected_version.as_deref());
-            assert_ne!(status, "overridden", "Same version should not be 'overridden'");
+            assert_ne!(
+                status, "overridden",
+                "Same version should not be 'overridden'"
+            );
         }
         // Resolution should be direct_declaration, not "overrides N"
         assert_eq!(result.resolution.reason, "direct_declaration");
 
         // No version gap warnings for same-version duplicates
-        assert!(result.warnings.iter().all(|w| w.warning_type != "version_gap"));
+        assert!(result
+            .warnings
+            .iter()
+            .all(|w| w.warning_type != "version_gap"));
+    }
+
+    #[test]
+    fn test_why_depth_filter_preserves_selected_version() {
+        let input = r#"com.example:app:jar:1.0
++- org.foo:a:jar:1.0:compile
+|  \- org.foo:b:jar:1.0:compile
+|     \- org.foo:x:jar:2.0:runtime (managed from 1.0)
+\- org.foo:c:jar:1.0:compile
+   \- (org.foo:x:jar:2.0:runtime - omitted for duplicate)"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let key = ArtifactKey::new("org.foo", "x");
+        let opts = WhyOptions {
+            max_depth: Some(2),
+            ..Default::default()
+        };
+
+        let result = why_artifact(&graph, &key, &opts).unwrap();
+        assert_eq!(result.requests.len(), 1);
+        assert!(!result.requests[0].selected);
+        assert_eq!(result.selected_version.as_deref(), Some("2.0"));
+        assert_eq!(result.selected_scope.as_deref(), Some("runtime"));
+        assert_eq!(result.resolution.reason, "dependency_management_pin");
+        assert_eq!(
+            request_status_label(&result.requests[0], result.selected_version.as_deref()),
+            "duplicate"
+        );
     }
 
     #[test]

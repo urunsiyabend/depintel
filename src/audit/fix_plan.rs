@@ -86,10 +86,15 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
             // For each candidate version, a CVE is "fixed" if the candidate version
             // appears in that CVE's fixed_versions list.
             // Pick the version that fixes the most CVEs. On ties, prefer the one
-            // that appears latest alphabetically (crude "newest" heuristic).
+            // that sorts newest, comparing digit runs numerically rather than
+            // lexically (so 2.10 ranks above 2.9). This is not a Maven range check.
             let best_version = version_to_fixes
                 .iter()
-                .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(b.0)))
+                .max_by(|a, b| {
+                    a.1.len()
+                        .cmp(&b.1.len())
+                        .then_with(|| compare_versions(a.0, b.0))
+                })
                 .map(|(v, _)| *v)
                 .unwrap_or("");
 
@@ -145,6 +150,40 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
         total_cves_fixed: total_fixed,
         total_cves_remaining: total_remaining,
     }
+}
+
+/// Natural ordering for upgrade tie-breaking, not Maven range evaluation.
+/// Compare digit runs without integer parsing so long version numbers cannot overflow.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut left, mut right) = (a.as_bytes(), b.as_bytes());
+    while !left.is_empty() && !right.is_empty() {
+        let order = if left[0].is_ascii_digit() && right[0].is_ascii_digit() {
+            let left_end = left.iter().take_while(|c| c.is_ascii_digit()).count();
+            let right_end = right.iter().take_while(|c| c.is_ascii_digit()).count();
+            let left_number = &left[..left_end];
+            let right_number = &right[..right_end];
+            let left_number =
+                &left_number[left_number.iter().take_while(|c| **c == b'0').count()..];
+            let right_number =
+                &right_number[right_number.iter().take_while(|c| **c == b'0').count()..];
+            let order = left_number
+                .len()
+                .cmp(&right_number.len())
+                .then_with(|| left_number.cmp(right_number));
+            left = &left[left_end..];
+            right = &right[right_end..];
+            order
+        } else {
+            let order = left[0].cmp(&right[0]);
+            left = &left[1..];
+            right = &right[1..];
+            order
+        };
+        if !order.is_eq() {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len()).then_with(|| a.cmp(b))
 }
 
 fn preferred_id(vuln: &crate::audit::osv::Vulnerability) -> &str {
@@ -282,6 +321,35 @@ mod tests {
         assert_eq!(plan.upgrades[0].cves_fixed, vec![cve]);
         assert_eq!(plan.upgrades[0].cves_fixed_count, 1);
         assert_eq!(plan.upgrades[0].severity_summary, "1 CRITICAL");
+    }
+
+    #[test]
+    fn fixed_version_ties_prefer_numerically_newer_release() {
+        for (older, newer) in [("2.9", "2.10"), ("9.0.0", "10.0.0"), ("1.0.9", "1.0.10")] {
+            let report = AuditReport {
+                module: "test".to_string(),
+                summary: AuditSummary::default(),
+                findings: vec![AuditFinding {
+                    group: "org.example".to_string(),
+                    artifact: "lib".to_string(),
+                    version: "1.0".to_string(),
+                    scope: "compile".to_string(),
+                    direct: true,
+                    paths: vec![],
+                    vulnerabilities: vec![make_vuln(
+                        "CVE-2024-001",
+                        VulnSeverity::High,
+                        vec![older, newer],
+                    )],
+                    max_severity: VulnSeverity::High,
+                }],
+                artifacts_scanned: 1,
+            };
+            let plan = compute_fix_plan(&[report]);
+            assert_eq!(plan.upgrades[0].to_version, newer);
+            assert_eq!(plan.total_cves_fixed, 1);
+            assert_eq!(plan.total_cves_remaining, 0);
+        }
     }
 
     #[test]

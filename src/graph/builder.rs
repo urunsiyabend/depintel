@@ -164,6 +164,10 @@ pub fn build_graph(module_tree: &ModuleTree) -> DepGraph {
         root_idx,
         &root_node.children,
         vec![root_label],
+        &[(
+            root_node.artifact.key.clone(),
+            root_node.artifact.version.clone(),
+        )],
     );
 
     DepGraph {
@@ -247,6 +251,7 @@ fn add_children(
     parent_idx: NodeIndex,
     children: &[TreeNode],
     parent_path: Vec<String>,
+    parent_ancestors: &[(ArtifactKey, String)],
 ) {
     for child in children {
         let key = child.artifact.key.clone();
@@ -259,6 +264,8 @@ fn add_children(
         // Record version request
         let mut path = parent_path.clone();
         path.push(label.clone());
+        let mut ancestors = parent_ancestors.to_vec();
+        ancestors.push((key.clone(), version.clone()));
 
         version_requests
             .entry(key.clone())
@@ -276,8 +283,10 @@ fn add_children(
         if is_duplicate {
             let visit_key = (key.clone(), version.clone());
             if let Some(canon_children) = canonical.get(&visit_key) {
-                let mut visited: HashSet<(ArtifactKey, String)> = HashSet::new();
-                visited.insert(visit_key);
+                // Include real ancestors as well as the duplicate itself: a
+                // canonical subtree can point back into the actual parent path.
+                let mut visited: HashSet<(ArtifactKey, String)> =
+                    ancestors.iter().cloned().collect();
                 let canon_children = canon_children.clone();
                 emit_virtual_requests(
                     &canon_children,
@@ -313,6 +322,7 @@ fn add_children(
                 child_idx,
                 &child.children,
                 path,
+                &ancestors,
             );
         }
     }
@@ -373,6 +383,40 @@ mod tests {
             }),
             "nested duplicates must expand their canonical subtree"
         );
+    }
+
+    #[test]
+    fn test_duplicate_subtree_does_not_revisit_real_ancestors() {
+        let input = r#"com.example:app:jar:1.0
++- org.foo:a:jar:1.0:compile
+|  \- (org.foo:b:jar:1.0:compile - omitted for duplicate)
+\- org.foo:b:jar:1.0:compile
+   +- (org.foo:a:jar:1.0:compile - omitted for duplicate)
+   \- org.foo:leaf:jar:1.0:compile"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        for requests in graph.version_requests.values() {
+            for request in requests.iter().filter(|r| r.virtual_path) {
+                let unique: HashSet<_> = request.path.iter().collect();
+                assert_eq!(
+                    unique.len(),
+                    request.path.len(),
+                    "reconstructed path must not revisit an ancestor: {:?}",
+                    request.path
+                );
+            }
+        }
+        let leaves = graph
+            .get_requests(&ArtifactKey::new("org.foo", "leaf"))
+            .unwrap();
+        assert!(leaves.iter().any(|r| r.virtual_path
+            && r.path
+                == vec![
+                    "com.example:app:1.0",
+                    "org.foo:a:1.0",
+                    "org.foo:b:1.0",
+                    "org.foo:leaf:1.0"
+                ]));
     }
 
     #[test]
