@@ -56,6 +56,15 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
                 }
             }
 
+            // OSV can return multiple advisory records with the same CVE alias.
+            // Count CVE identities, not advisory records (or repeated fix events).
+            for ids in version_to_fixes.values_mut() {
+                ids.sort_unstable();
+                ids.dedup();
+            }
+            unfixable.sort();
+            unfixable.dedup();
+
             if version_to_fixes.is_empty() {
                 // All CVEs are unfixable
                 total_remaining += unfixable.len();
@@ -80,11 +89,7 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
             // that appears latest alphabetically (crude "newest" heuristic).
             let best_version = version_to_fixes
                 .iter()
-                .max_by(|a, b| {
-                    a.1.len()
-                        .cmp(&b.1.len())
-                        .then_with(|| a.0.cmp(b.0))
-                })
+                .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(b.0)))
                 .map(|(v, _)| *v)
                 .unwrap_or("");
 
@@ -96,6 +101,7 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
 
             // CVEs NOT fixed by the best version (either unfixable or need a different version)
             let mut remaining = unfixable;
+            remaining.retain(|id| !fixed_ids.contains(id));
             for vuln in &finding.vulnerabilities {
                 let vid = preferred_id(vuln);
                 if !fixed_ids.contains(&vid.to_string())
@@ -110,10 +116,7 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
             }
 
             // Severity summary
-            let severity_summary = build_severity_summary(
-                &finding.vulnerabilities,
-                &fixed_ids,
-            );
+            let severity_summary = build_severity_summary(&finding.vulnerabilities, &fixed_ids);
 
             total_fixed += fixed_ids.len();
             total_remaining += remaining.len();
@@ -160,12 +163,19 @@ fn build_severity_summary(
     let mut high = 0;
     let mut med = 0;
     let mut low = 0;
+    let mut severities: HashMap<&str, VulnSeverity> = HashMap::new();
     for v in vulns {
         let vid = preferred_id(v);
         if !fixed_ids.contains(&vid.to_string()) {
             continue;
         }
-        match v.severity {
+        severities
+            .entry(vid)
+            .and_modify(|severity| *severity = (*severity).max(v.severity))
+            .or_insert(v.severity);
+    }
+    for severity in severities.values() {
+        match severity {
             VulnSeverity::Critical => crit += 1,
             VulnSeverity::High => high += 1,
             VulnSeverity::Medium => med += 1,
@@ -174,10 +184,18 @@ fn build_severity_summary(
         }
     }
     let mut parts: Vec<String> = Vec::new();
-    if crit > 0 { parts.push(format!("{} CRITICAL", crit)); }
-    if high > 0 { parts.push(format!("{} HIGH", high)); }
-    if med > 0 { parts.push(format!("{} MEDIUM", med)); }
-    if low > 0 { parts.push(format!("{} LOW", low)); }
+    if crit > 0 {
+        parts.push(format!("{} CRITICAL", crit));
+    }
+    if high > 0 {
+        parts.push(format!("{} HIGH", high));
+    }
+    if med > 0 {
+        parts.push(format!("{} MEDIUM", med));
+    }
+    if low > 0 {
+        parts.push(format!("{} LOW", low));
+    }
     parts.join(", ")
 }
 
@@ -190,7 +208,11 @@ mod tests {
     fn make_vuln(id: &str, severity: VulnSeverity, fixed: Vec<&str>) -> Vulnerability {
         Vulnerability {
             id: id.to_string(),
-            aliases: if id.starts_with("CVE-") { vec![id.to_string()] } else { vec![] },
+            aliases: if id.starts_with("CVE-") {
+                vec![id.to_string()]
+            } else {
+                vec![]
+            },
             summary: format!("Test vuln {}", id),
             severity,
             cvss_score: None,
@@ -203,7 +225,13 @@ mod tests {
     fn test_basic_fix_plan() {
         let report = AuditReport {
             module: "test".to_string(),
-            summary: AuditSummary { critical: 1, high: 1, medium: 0, low: 0, unknown: 0 },
+            summary: AuditSummary {
+                critical: 1,
+                high: 1,
+                medium: 0,
+                low: 0,
+                unknown: 0,
+            },
             findings: vec![AuditFinding {
                 group: "org.example".to_string(),
                 artifact: "lib".to_string(),
@@ -228,10 +256,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unfixable_cves() {
+    fn shared_cve_alias_is_counted_once_in_fix_plan() {
+        let cve = "CVE-2024-001";
+        let mut ghsa = make_vuln("GHSA-test", VulnSeverity::High, vec!["1.1"]);
+        ghsa.aliases.push(cve.to_string());
         let report = AuditReport {
             module: "test".to_string(),
-            summary: AuditSummary { critical: 0, high: 1, medium: 0, low: 0, unknown: 0 },
+            summary: AuditSummary::default(),
             findings: vec![AuditFinding {
                 group: "org.example".to_string(),
                 artifact: "lib".to_string(),
@@ -239,9 +270,39 @@ mod tests {
                 scope: "compile".to_string(),
                 direct: true,
                 paths: vec![],
-                vulnerabilities: vec![
-                    make_vuln("CVE-2024-001", VulnSeverity::High, vec![]),
-                ],
+                vulnerabilities: vec![ghsa, make_vuln(cve, VulnSeverity::Critical, vec!["1.1"])],
+                max_severity: VulnSeverity::High,
+            }],
+            artifacts_scanned: 1,
+        };
+
+        let plan = compute_fix_plan(&[report]);
+        assert_eq!(plan.total_cves_fixed, 1);
+        assert_eq!(plan.total_cves_remaining, 0);
+        assert_eq!(plan.upgrades[0].cves_fixed, vec![cve]);
+        assert_eq!(plan.upgrades[0].cves_fixed_count, 1);
+        assert_eq!(plan.upgrades[0].severity_summary, "1 CRITICAL");
+    }
+
+    #[test]
+    fn test_unfixable_cves() {
+        let report = AuditReport {
+            module: "test".to_string(),
+            summary: AuditSummary {
+                critical: 0,
+                high: 1,
+                medium: 0,
+                low: 0,
+                unknown: 0,
+            },
+            findings: vec![AuditFinding {
+                group: "org.example".to_string(),
+                artifact: "lib".to_string(),
+                version: "1.0".to_string(),
+                scope: "compile".to_string(),
+                direct: true,
+                paths: vec![],
+                vulnerabilities: vec![make_vuln("CVE-2024-001", VulnSeverity::High, vec![])],
                 max_severity: VulnSeverity::High,
             }],
             artifacts_scanned: 5,

@@ -131,17 +131,18 @@ mod tests {
     use super::*;
     use crate::audit::osv::VulnSeverity;
 
-    fn temp_cache() -> OsvCache {
-        let dir = tempfile::tempdir().unwrap().into_path();
-        OsvCache {
-            dir,
+    fn temp_cache() -> (tempfile::TempDir, OsvCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OsvCache {
+            dir: dir.path().to_path_buf(),
             ttl_seconds: DEFAULT_TTL_SECONDS,
-        }
+        };
+        (dir, cache)
     }
 
     #[test]
     fn put_then_get_roundtrip() {
-        let cache = temp_cache();
+        let (_dir, cache) = temp_cache();
         let v = Vulnerability {
             id: "GHSA-test".to_string(),
             aliases: vec!["CVE-1999-9999".to_string()],
@@ -160,13 +161,14 @@ mod tests {
 
     #[test]
     fn miss_returns_none() {
-        let cache = temp_cache();
+        let (_dir, cache) = temp_cache();
         assert!(cache.get("g:a:1.0.0").unwrap().is_none());
     }
 
     #[test]
     fn ttl_expired_returns_none() {
-        let cache = temp_cache().with_ttl(0);
+        let (_dir, cache) = temp_cache();
+        let cache = cache.with_ttl(0);
         cache.put("g:a:1.0.0", &[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         // ttl=0 → anything older than now is expired

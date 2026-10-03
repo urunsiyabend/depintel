@@ -317,6 +317,16 @@ fn parse_cvss_base_score(score: &str) -> Option<f64> {
         return None;
     }
 
+    // CVSS v3 has a zero base score when all three impact metrics are None,
+    // regardless of exploitability. Do not let heuristic bonuses invent impact.
+    if (score.starts_with("CVSS:3.0/") || score.starts_with("CVSS:3.1/"))
+        && c == "N"
+        && i == "N"
+        && a == "N"
+    {
+        return Some(0.0);
+    }
+
     // Approximate base impact: HIGH on any of C/I/A → strong contribution.
     let impact_count = [c, i, a].iter().filter(|x| **x == "H").count();
     let mut score: f64 = match impact_count {
@@ -434,6 +444,28 @@ mod tests {
         // CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H is Log4Shell, score 10.0
         let s = parse_cvss_base_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H").unwrap();
         assert!(s >= 9.0, "expected critical-tier, got {}", s);
+    }
+
+    #[test]
+    fn zero_impact_cvss_v3_is_not_reported_as_medium() {
+        let query = OsvQuery {
+            group: "org.example".to_string(),
+            artifact: "lib".to_string(),
+            version: "1.0".to_string(),
+        };
+        for version in ["3.0", "3.1"] {
+            for scope in ["U", "C"] {
+                let vector = format!("CVSS:{version}/AV:N/AC:L/PR:N/UI:N/S:{scope}/C:N/I:N/A:N");
+                let raw: OsvVuln = serde_json::from_value(serde_json::json!({
+                    "id": "GHSA-test",
+                    "severity": [{"type": "CVSS_V3", "score": vector}],
+                }))
+                .unwrap();
+                let vuln = enrich_vuln(raw, &query);
+                assert_eq!(vuln.cvss_score, Some(0.0), "{vector}");
+                assert_eq!(vuln.severity, VulnSeverity::Unknown, "{vector}");
+            }
+        }
     }
 
     #[test]

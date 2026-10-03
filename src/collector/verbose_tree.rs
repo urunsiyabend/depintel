@@ -122,8 +122,10 @@ fn build_children_from_lines(lines: &[&str], target_depth: usize) -> Vec<TreeNod
                 }
 
                 if child_lines_start < child_lines_end {
-                    node.children =
-                        build_children_from_lines(&lines[child_lines_start..child_lines_end], target_depth + 1);
+                    node.children = build_children_from_lines(
+                        &lines[child_lines_start..child_lines_end],
+                        target_depth + 1,
+                    );
                 }
 
                 children.push(node);
@@ -151,6 +153,11 @@ fn compute_depth(line: &str) -> usize {
                 depth += 1;
                 // Skip the tree drawing characters for this level
                 i += 3; // typically "+- " or "|  " or "\- "
+            }
+            ' ' if chars[i..].starts_with(&[' ', ' ', ' ']) => {
+                // Maven leaves a blank three-character level after a last-child branch.
+                depth += 1;
+                i += 3;
             }
             ' ' => {
                 i += 1;
@@ -303,6 +310,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_children_under_last_branch() {
+        let input = r#"[INFO] com.example:app:jar:1.0
+[INFO] \- org.foo:parent:jar:1.0:compile
+[INFO]    +- org.foo:child:jar:2.0:compile
+[INFO]    |  \- org.foo:grandchild:jar:3.0:compile
+[INFO]    \- org.foo:last-child:jar:4.0:compile
+[INFO]       \- org.foo:last-grandchild:jar:5.0:compile"#;
+
+        let trees = parse_verbose_tree(input).unwrap();
+        let root = &trees[0].root;
+        assert_eq!(root.children.len(), 1);
+        let parent = &root.children[0];
+        assert_eq!(parent.children.len(), 2);
+        assert_eq!(parent.children[0].artifact.key.artifact_id, "child");
+        assert_eq!(
+            parent.children[0].children[0].artifact.key.artifact_id,
+            "grandchild"
+        );
+        assert_eq!(parent.children[1].artifact.key.artifact_id, "last-child");
+        assert_eq!(
+            parent.children[1].children[0].artifact.key.artifact_id,
+            "last-grandchild"
+        );
+    }
+
+    #[test]
     fn test_parse_simple_tree() {
         let input = r#"[INFO] com.example:app:jar:1.0.0
 [INFO] +- org.springframework.boot:spring-boot-starter-web:jar:3.2.2:compile
@@ -346,8 +379,7 @@ mod tests {
 
     #[test]
     fn test_parse_managed_from() {
-        let input =
-            "org.springframework:spring-core:jar:6.1.3:compile (managed from 6.0.12)";
+        let input = "org.springframework:spring-core:jar:6.1.3:compile (managed from 6.0.12)";
         let (artifact_part, status, managed) = parse_status_and_managed(input);
 
         assert_eq!(status, NodeStatus::Selected);

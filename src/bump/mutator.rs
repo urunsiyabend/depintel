@@ -30,6 +30,10 @@ struct PomIndex {
     project_close_start: Option<usize>,
     /// Byte position just before `</dependencies>` inside `<dependencyManagement>`.
     dep_mgmt_deps_close_start: Option<usize>,
+    /// Byte position just before the root `</dependencyManagement>`.
+    dep_mgmt_close_start: Option<usize>,
+    /// A self-closing root management section or its dependencies child.
+    dep_mgmt_empty: Option<(usize, usize, &'static str)>,
     /// Version sites for managed entries.
     existing_mgmt: Vec<VersionSite>,
     /// Version sites for direct entries (at project-level OR inside a `<profile>`).
@@ -45,7 +49,9 @@ struct ElementStack {
 
 impl ElementStack {
     fn new() -> Self {
-        Self { elements: Vec::new() }
+        Self {
+            elements: Vec::new(),
+        }
     }
     fn push(&mut self, name: String) {
         self.elements.push(name);
@@ -79,19 +85,12 @@ pub fn try_patch_in_place(
     artifact: &str,
     target_version: &str,
 ) -> Result<Option<String>> {
-    let index = analyze_pom(content, group, artifact)?;
+    let mut index = analyze_pom(content, group, artifact)?;
+    index.existing_direct.append(&mut index.existing_mgmt);
     if !index.existing_direct.is_empty() {
         return Ok(Some(splice_sites(
             content,
             &index.existing_direct,
-            &index.properties,
-            target_version,
-        )));
-    }
-    if !index.existing_mgmt.is_empty() {
-        return Ok(Some(splice_sites(
-            content,
-            &index.existing_mgmt,
             &index.properties,
             target_version,
         )));
@@ -136,7 +135,9 @@ pub fn discover_module_poms(root_dir: &Path) -> Result<Vec<PathBuf>> {
             // Maven treats `<module>foo</module>` as a sibling directory that
             // contains its own pom.xml. Strip any trailing `/pom.xml` some
             // projects write by mistake.
-            let rel = module_rel.trim_end_matches("/pom.xml").trim_end_matches("\\pom.xml");
+            let rel = module_rel
+                .trim_end_matches("/pom.xml")
+                .trim_end_matches("\\pom.xml");
             stack.push(dir.join(rel));
         }
     }
@@ -186,28 +187,16 @@ pub fn mutate_pom_xml(
     artifact: &str,
     target_version: &str,
 ) -> Result<String> {
-    let index = analyze_pom(content, group, artifact)?;
+    let mut index = analyze_pom(content, group, artifact)?;
 
-    // Case 0: one or more direct <dependency> entries pin a version.
-    // Patch ALL of them (classifier-qualified duplicates or profile siblings
-    // must move together or Maven will silently pick the unpatched sibling).
-    // For sites whose <version> is a `${property}` reference, update the
-    // referenced property definition instead of the placeholder text so the
-    // POM's property indirection stays intact.
+    // Patch all explicit versions, both direct and managed: leaving a managed
+    // sibling unchanged can retain the old version for inherited dependencies.
+    // Preserve property indirection by updating definitions, not placeholders.
+    index.existing_direct.append(&mut index.existing_mgmt);
     if !index.existing_direct.is_empty() {
         return Ok(splice_sites(
             content,
             &index.existing_direct,
-            &index.properties,
-            target_version,
-        ));
-    }
-
-    // Case 1: one or more dependencyManagement entries exist → replace all.
-    if !index.existing_mgmt.is_empty() {
-        return Ok(splice_sites(
-            content,
-            &index.existing_mgmt,
             &index.properties,
             target_version,
         ));
@@ -224,10 +213,36 @@ pub fn mutate_pom_xml(
         return Ok(splice_ranges(content, &[prop_range], target_version));
     }
 
+    // Expand the existing empty container before using the normal insertion path.
+    // Retain its attributes and all surrounding bytes, including profile sections.
+    if let Some((start, end, name)) = index.dep_mgmt_empty {
+        let expanded = format!(
+            "{}{}></{}>{}",
+            &content[..start],
+            &content[start..end - 2],
+            name,
+            &content[end..]
+        );
+        return mutate_pom_xml(&expanded, group, artifact, target_version);
+    }
+
     // Case 2: dependencyManagement.dependencies exists → append new <dependency> entry.
     if let Some(splice_at) = index.dep_mgmt_deps_close_start {
         let insertion = format!(
             "    <dependency>\n      <groupId>{}</groupId>\n      <artifactId>{}</artifactId>\n      <version>{}</version>\n    </dependency>\n  ",
+            group, artifact, target_version
+        );
+        let mut out = String::with_capacity(content.len() + insertion.len());
+        out.push_str(&content[..splice_at]);
+        out.push_str(&insertion);
+        out.push_str(&content[splice_at..]);
+        return Ok(out);
+    }
+
+    // An existing root management section may not have a dependencies child yet.
+    if let Some(splice_at) = index.dep_mgmt_close_start {
+        let insertion = format!(
+            "    <dependencies>\n      <dependency>\n        <groupId>{}</groupId>\n        <artifactId>{}</artifactId>\n        <version>{}</version>\n      </dependency>\n    </dependencies>\n  ",
             group, artifact, target_version
         );
         let mut out = String::with_capacity(content.len() + insertion.len());
@@ -309,6 +324,8 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
         project_open_end: None,
         project_close_start: None,
         dep_mgmt_deps_close_start: None,
+        dep_mgmt_close_start: None,
+        dep_mgmt_empty: None,
         existing_mgmt: Vec::new(),
         existing_direct: Vec::new(),
         properties: HashMap::new(),
@@ -350,17 +367,45 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
                     });
                 }
             }
+            Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let container = if stack.elements.len() == 1
+                    && stack.matches_suffix(&["project"])
+                    && name.as_ref() == b"dependencyManagement"
+                {
+                    Some("dependencyManagement")
+                } else if stack.elements.len() == 2
+                    && stack.matches_suffix(&["project", "dependencyManagement"])
+                    && name.as_ref() == b"dependencies"
+                {
+                    Some("dependencies")
+                } else {
+                    None
+                };
+                if let Some(name) = container {
+                    index.dep_mgmt_empty =
+                        Some((pos_before, reader.buffer_position() as usize, name));
+                }
+            }
             Ok(Event::End(e)) => {
                 let name_bytes = e.name().as_ref().to_vec();
                 let name = String::from_utf8_lossy(&name_bytes).into_owned();
                 let pos_of_close_open = pos_before;
 
-                // Remember the LAST `<dependencyManagement><dependencies>` close
-                // so new entries can be appended there.
-                if stack.matches_suffix(&["dependencyManagement", "dependencies"])
+                // A fallback override must be unconditional, not scoped to a
+                // possibly inactive profile's dependencyManagement section.
+                if stack.elements.len() == 3
+                    && stack.matches_suffix(&["project", "dependencyManagement", "dependencies"])
                     && name == "dependencies"
                 {
                     index.dep_mgmt_deps_close_start = Some(pos_of_close_open);
+                }
+
+                if stack.elements.len() == 2
+                    && stack.matches_suffix(&["project", "dependencyManagement"])
+                    && name == "dependencyManagement"
+                {
+                    index.dep_mgmt_close_start = Some(pos_of_close_open);
                 }
 
                 if name == "dependency" && classify_dep(&stack.elements).is_some() {
@@ -489,7 +534,10 @@ fn find_shared_group_property(
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 stack.push(name.clone());
                 if classify_dep(&stack.elements).is_some() {
-                    current = Some(DepScan { group_id: None, version_prop: None });
+                    current = Some(DepScan {
+                        group_id: None,
+                        version_prop: None,
+                    });
                 }
             }
             Ok(Event::End(e)) => {
@@ -708,6 +756,139 @@ mod tests {
     }
 
     #[test]
+    fn direct_and_managed_versions_are_patched_together() {
+        let pom = r#"<project>
+  <!-- Keep both declarations aligned, including inherited users. -->
+  <dependencyManagement><dependencies><dependency>
+    <groupId>g</groupId><artifactId>a</artifactId><version> 1.0 </version>
+  </dependency></dependencies></dependencyManagement>
+  <dependencies><dependency>
+    <groupId>g</groupId><artifactId>a</artifactId><version>1.0</version>
+  </dependency></dependencies>
+</project>"#;
+        let expected = pom.replace("1.0", "2.0");
+        assert_eq!(mutate_pom_xml(pom, "g", "a", "2.0").unwrap(), expected);
+        assert_eq!(
+            try_patch_in_place(pom, "g", "a", "2.0").unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn transitive_override_is_inserted_in_project_not_profile() {
+        let profile = r#"<profiles><profile><id>optional</id>
+  <!-- This profile must stay byte-for-byte unchanged. -->
+  <dependencyManagement><dependencies><dependency>
+    <groupId>other</groupId><artifactId>lib</artifactId><version>1</version>
+  </dependency></dependencies></dependencyManagement>
+</profile></profiles>"#;
+        for root_management in [
+            "",
+            "<dependencyManagement><dependencies></dependencies></dependencyManagement>",
+        ] {
+            let pom = format!("<project>{root_management}{profile}</project>");
+            let out = mutate_pom_xml(&pom, "g", "a", "2.0").unwrap();
+            assert!(out.contains(profile), "profile was modified:\n{out}");
+            let mut reader = Reader::from_str(&out);
+            let mut stack = Vec::new();
+            let mut target_parents = Vec::new();
+            loop {
+                match reader.read_event().unwrap() {
+                    Event::Start(e) => {
+                        stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                    }
+                    Event::End(_) => {
+                        stack.pop();
+                    }
+                    Event::Text(t)
+                        if stack.last().map(String::as_str) == Some("artifactId")
+                            && t.unescape().unwrap() == "a" =>
+                    {
+                        target_parents.push(stack.clone());
+                    }
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                target_parents,
+                vec![vec![
+                    "project",
+                    "dependencyManagement",
+                    "dependencies",
+                    "dependency",
+                    "artifactId"
+                ]]
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_reuses_management_without_dependencies() {
+        let pom =
+            "<project><dependencyManagement><!-- retain me --></dependencyManagement></project>";
+        let out = mutate_pom_xml(pom, "g", "a", "2.0").unwrap();
+        assert_eq!(
+            out.matches("<dependencyManagement>").count(),
+            1,
+            "fallback duplicated the root management section:\n{out}"
+        );
+        assert!(out.contains("<dependencyManagement><!-- retain me -->"));
+        assert!(out.contains("<artifactId>a</artifactId>"));
+        assert!(out.find("<dependencies>").unwrap() < out.find("</dependencyManagement>").unwrap());
+    }
+
+    #[test]
+    fn fallback_expands_self_closing_management_sections() {
+        for management in [
+            "<dependencyManagement/>",
+            "<dependencyManagement />",
+            "<dependencyManagement><dependencies/></dependencyManagement>",
+            "<dependencyManagement><!-- keep --><dependencies /></dependencyManagement>",
+        ] {
+            let profile = "<profiles><profile><id>optional</id><dependencyManagement><dependencies/></dependencyManagement></profile></profiles>";
+            let pom = format!("<project>{management}{profile}</project>");
+            let out = mutate_pom_xml(&pom, "g", "a", "2.0").unwrap();
+            let mut reader = Reader::from_str(&out);
+            let mut stack = Vec::new();
+            let mut management_count = 0;
+            let mut dependencies_count = 0;
+            loop {
+                let event = reader.read_event().unwrap();
+                let is_empty = matches!(event, Event::Empty(_));
+                match event {
+                    Event::Start(e) | Event::Empty(e) => {
+                        let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                        if stack == ["project"] && name == "dependencyManagement" {
+                            management_count += 1;
+                        }
+                        if stack == ["project", "dependencyManagement"] && name == "dependencies" {
+                            dependencies_count += 1;
+                        }
+                        if !is_empty {
+                            stack.push(name);
+                        }
+                    }
+                    Event::End(_) => {
+                        stack.pop();
+                    }
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(management_count, 1, "duplicate root management:\n{out}");
+            assert_eq!(dependencies_count, 1, "duplicate root dependencies:\n{out}");
+            assert!(out.contains("<artifactId>a</artifactId>"));
+            assert!(out.contains("<version>2.0</version>"));
+            assert!(out.contains(profile), "profile changed:\n{out}");
+            if management.contains("<!-- keep -->") {
+                assert!(out.contains("<!-- keep -->"));
+            }
+            assert_eq!(mutate_pom_xml(&out, "g", "a", "2.0").unwrap(), out);
+        }
+    }
+
+    #[test]
     fn creates_depmgmt_for_transitive_target() {
         // A transitive dep not mentioned in the POM at all → create a managed entry.
         let out = mutate_pom_xml(
@@ -734,9 +915,7 @@ mod tests {
         // The other-lib entry is preserved
         assert!(out.contains("other-lib"));
         // log4j now has a managed entry pinning 2.17.2
-        let count_mgmt = out
-            .match_indices("<dependencyManagement>")
-            .count();
+        let count_mgmt = out.match_indices("<dependencyManagement>").count();
         assert_eq!(count_mgmt, 1, "should not duplicate dependencyManagement");
         assert!(out.contains("<version>2.17.2</version>"));
     }
@@ -779,10 +958,26 @@ mod tests {
   </dependencies>
 </project>"#;
         let out = mutate_pom_xml(pom, "org.apache.logging.log4j", "log4j-core", "2.17.2").unwrap();
-        assert!(out.contains("<log4j.version>2.17.2</log4j.version>"), "property not updated:\n{}", out);
-        assert!(out.contains("${log4j.version}"), "placeholder should be preserved:\n{}", out);
-        assert!(!out.contains("2.14.1"), "old version should be gone:\n{}", out);
-        assert!(!out.contains("<dependencyManagement>"), "should not inject depMgmt:\n{}", out);
+        assert!(
+            out.contains("<log4j.version>2.17.2</log4j.version>"),
+            "property not updated:\n{}",
+            out
+        );
+        assert!(
+            out.contains("${log4j.version}"),
+            "placeholder should be preserved:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("2.14.1"),
+            "old version should be gone:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("<dependencyManagement>"),
+            "should not inject depMgmt:\n{}",
+            out
+        );
     }
 
     #[test]
@@ -807,7 +1002,11 @@ mod tests {
         let out = mutate_pom_xml(pom, "org.apache.logging.log4j", "log4j-core", "2.17.2").unwrap();
         assert!(!out.contains("2.14.1"), "profile dep not updated:\n{}", out);
         assert!(out.contains("<version>2.17.2</version>"));
-        assert!(!out.contains("<dependencyManagement>"), "should not inject depMgmt for profile dep:\n{}", out);
+        assert!(
+            !out.contains("<dependencyManagement>"),
+            "should not inject depMgmt for profile dep:\n{}",
+            out
+        );
     }
 
     #[test]
@@ -829,16 +1028,19 @@ mod tests {
         let out = mutate_pom_xml(pom, "io.netty", "netty-all", "4.1.132.Final").unwrap();
         assert!(
             out.contains("<netty.version>4.1.132.Final</netty.version>"),
-            "shared property should be updated:\n{}", out
+            "shared property should be updated:\n{}",
+            out
         );
         assert!(
             !out.contains("4.1.129.Final"),
-            "old version should be gone:\n{}", out
+            "old version should be gone:\n{}",
+            out
         );
         // Should NOT inject a dependencyManagement entry since property update suffices
         assert!(
             !out.contains("<dependencyManagement>"),
-            "should not add depMgmt when property update covers it:\n{}", out
+            "should not add depMgmt when property update covers it:\n{}",
+            out
         );
     }
 
@@ -856,8 +1058,7 @@ mod tests {
     </dependency>
   </dependencies>
 </project>"#;
-        let result = try_patch_in_place(pom, "io.netty", "netty-all", "4.1.132.Final")
-            .unwrap();
+        let result = try_patch_in_place(pom, "io.netty", "netty-all", "4.1.132.Final").unwrap();
         assert!(result.is_some(), "should match via shared group property");
         let out = result.unwrap();
         assert!(out.contains("4.1.132.Final"));
@@ -1005,7 +1206,10 @@ mod tests {
         // Fix verification: downgrade should NOT also be flagged as
         // `minor_versions_skipped_N`.
         let j = crate::bump::scorer::classify_version_jump("1.10.0", "1.6.0");
-        assert_eq!(j.minor_skipped, 0, "downgrade shouldn't populate minor_skipped");
+        assert_eq!(
+            j.minor_skipped, 0,
+            "downgrade shouldn't populate minor_skipped"
+        );
         assert!(j.is_downgrade);
     }
 
@@ -1089,7 +1293,11 @@ mod tests {
         .unwrap();
         // `missing/` directory intentionally not created.
         let poms = discover_module_poms(root).unwrap();
-        assert_eq!(poms.len(), 1, "missing child should be skipped, not errored");
+        assert_eq!(
+            poms.len(),
+            1,
+            "missing child should be skipped, not errored"
+        );
     }
 
     #[test]

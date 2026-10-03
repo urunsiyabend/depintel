@@ -41,7 +41,9 @@ pub struct VersionRequest {
 impl DepGraph {
     /// Find node index for a specific artifact key + version.
     pub fn find_node_versioned(&self, key: &ArtifactKey, version: &str) -> Option<NodeIndex> {
-        self.node_index.get(&(key.clone(), version.to_string())).copied()
+        self.node_index
+            .get(&(key.clone(), version.to_string()))
+            .copied()
     }
 
     /// Get all version requests for an artifact.
@@ -113,7 +115,10 @@ impl DepGraph {
 /// rest are folded in via [`DepGraph::extend_with`]. For single-module
 /// projects this is equivalent to calling [`build_graph`] on the lone tree.
 pub fn build_combined_graph(trees: &[ModuleTree]) -> DepGraph {
-    assert!(!trees.is_empty(), "build_combined_graph requires at least one tree");
+    assert!(
+        !trees.is_empty(),
+        "build_combined_graph requires at least one tree"
+    );
     let mut combined = build_graph(&trees[0]);
     for tree in &trees[1..] {
         combined.extend_with(build_graph(tree));
@@ -142,7 +147,10 @@ pub fn build_graph(module_tree: &ModuleTree) -> DepGraph {
     };
     let root_idx = graph.add_node(root_gn);
     node_index.insert(
-        (root_node.artifact.key.clone(), root_node.artifact.version.clone()),
+        (
+            root_node.artifact.key.clone(),
+            root_node.artifact.version.clone(),
+        ),
         root_idx,
     );
 
@@ -168,10 +176,7 @@ pub fn build_graph(module_tree: &ModuleTree) -> DepGraph {
 
 /// Walk the parsed tree once and record children for each (key, version) the first time
 /// it appears as a fully-expanded Selected node.
-fn collect_canonical(
-    node: &TreeNode,
-    map: &mut HashMap<(ArtifactKey, String), Vec<TreeNode>>,
-) {
+fn collect_canonical(node: &TreeNode, map: &mut HashMap<(ArtifactKey, String), Vec<TreeNode>>) {
     let k = (node.artifact.key.clone(), node.artifact.version.clone());
     if matches!(node.status, NodeStatus::Selected)
         && !node.children.is_empty()
@@ -194,10 +199,6 @@ fn emit_virtual_requests(
     visited: &mut HashSet<(ArtifactKey, String)>,
 ) {
     for vchild in virtual_children {
-        // Skip conflict/duplicate leaves at this level — they'd just repeat.
-        if !matches!(vchild.status, NodeStatus::Selected) {
-            continue;
-        }
         let key = vchild.artifact.key.clone();
         let version = vchild.artifact.version.clone();
         let visit_key = (key.clone(), version.clone());
@@ -219,6 +220,11 @@ fn emit_virtual_requests(
                 managed_from: vchild.managed_from.clone(),
                 virtual_path: true,
             });
+
+        // Losing versions contribute a request, but their subtrees are not resolved.
+        if matches!(vchild.status, NodeStatus::OmittedForConflict { .. }) {
+            continue;
+        }
 
         visited.insert(visit_key.clone());
         let next_children: &[TreeNode] = if !vchild.children.is_empty() {
@@ -318,6 +324,58 @@ mod tests {
     use crate::collector::verbose_tree::parse_verbose_tree;
 
     #[test]
+    fn test_duplicate_subtree_preserves_omitted_requests() {
+        let input = r#"com.example:app:jar:1.0
++- org.foo:a:jar:1.0:compile
+|  +- (org.foo:x:jar:1.0:compile - omitted for conflict with 2.0)
+|  \- (org.foo:c:jar:1.0:compile - omitted for duplicate)
++- org.foo:x:jar:2.0:compile
++- org.foo:c:jar:1.0:compile
+|  \- org.foo:leaf:jar:1.0:compile
+\- org.foo:b:jar:1.0:compile
+   \- (org.foo:a:jar:1.0:compile - omitted for duplicate)"#;
+
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let x_requests = graph
+            .get_requests(&ArtifactKey::new("org.foo", "x"))
+            .unwrap();
+        assert!(
+            x_requests.iter().any(|r| {
+                r.version == "1.0"
+                    && !r.selected
+                    && r.virtual_path
+                    && r.path
+                        == vec![
+                            "com.example:app:1.0",
+                            "org.foo:b:1.0",
+                            "org.foo:a:1.0",
+                            "org.foo:x:1.0",
+                        ]
+            }),
+            "the conflict request must also be visible under the duplicate parent"
+        );
+
+        let leaf_requests = graph
+            .get_requests(&ArtifactKey::new("org.foo", "leaf"))
+            .unwrap();
+        assert!(
+            leaf_requests.iter().any(|r| {
+                r.virtual_path
+                    && r.path
+                        == vec![
+                            "com.example:app:1.0",
+                            "org.foo:b:1.0",
+                            "org.foo:a:1.0",
+                            "org.foo:c:1.0",
+                            "org.foo:leaf:1.0",
+                        ]
+            }),
+            "nested duplicates must expand their canonical subtree"
+        );
+    }
+
+    #[test]
     fn test_build_simple_graph() {
         let input = r#"com.example:app:jar:1.0.0
 +- org.springframework:spring-web:jar:6.1.3:compile
@@ -352,7 +410,9 @@ mod tests {
 
         // One selected, one not
         assert!(requests.iter().any(|r| r.version == "2.15.3" && r.selected));
-        assert!(requests.iter().any(|r| r.version == "2.14.2" && !r.selected));
+        assert!(requests
+            .iter()
+            .any(|r| r.version == "2.14.2" && !r.selected));
 
         // It's a conflicted artifact
         let conflicts = graph.conflicted_artifacts();
@@ -405,10 +465,13 @@ mod tests {
 
         let qux_key = ArtifactKey::new("org.baz", "qux");
         let requests = graph.get_requests(&qux_key).unwrap();
-        assert_eq!(requests[0].path, vec![
-            "com.example:app:1.0.0",
-            "org.foo:bar:1.0",
-            "org.baz:qux:2.0",
-        ]);
+        assert_eq!(
+            requests[0].path,
+            vec![
+                "com.example:app:1.0.0",
+                "org.foo:bar:1.0",
+                "org.baz:qux:2.0",
+            ]
+        );
     }
 }
