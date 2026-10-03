@@ -25,8 +25,8 @@ pub fn load_if_valid(project_dir: &Path, current_fingerprint: &str) -> Result<Op
         return Ok(None);
     }
 
-    let stored_fp = std::fs::read_to_string(&fp_path)
-        .context("Failed to read cached fingerprint")?;
+    let stored_fp =
+        std::fs::read_to_string(&fp_path).context("Failed to read cached fingerprint")?;
 
     if stored_fp.trim() != current_fingerprint {
         return Ok(None);
@@ -58,10 +58,19 @@ pub fn save(
     let dir = cache_dir(project_dir);
     std::fs::create_dir_all(&dir)?;
 
-    std::fs::write(dir.join("fingerprint"), fingerprint)?;
+    // Withdraw the validity marker before changing any output. A failed write
+    // must not expose old or mixed output under either fingerprint.
+    let fp_path = dir.join("fingerprint");
+    match std::fs::remove_file(&fp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     std::fs::write(dir.join("effective-pom.xml"), effective_pom)?;
     std::fs::write(dir.join("verbose-tree.txt"), verbose_tree)?;
     std::fs::write(dir.join("dep-list.txt"), dep_list)?;
+    // Publish validity only after all output files have been written.
+    std::fs::write(fp_path, fingerprint)?;
 
     Ok(())
 }
@@ -132,6 +141,41 @@ fn read_cache_file(cache_dir: &Path, filename: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_save_does_not_publish_partial_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        save(project, "old", "old pom", "old tree", "old list").unwrap();
+
+        // A directory at an output-file path deterministically forces a write
+        // failure even when tests run as root; no permission or timing tricks.
+        let blocked_output = cache_dir(project).join("effective-pom.xml");
+        std::fs::remove_file(&blocked_output).unwrap();
+        std::fs::create_dir(&blocked_output).unwrap();
+        assert!(save(project, "new", "new pom", "new tree", "new list").is_err());
+        std::fs::remove_dir(&blocked_output).unwrap();
+
+        for fingerprint in ["new", "old"] {
+            let cached = load_partial(project, fingerprint).unwrap();
+            assert!(
+                cached.verbose_tree.is_none(),
+                "published stale tree for {fingerprint}"
+            );
+            assert!(
+                cached.dep_list.is_none(),
+                "published stale list for {fingerprint}"
+            );
+            assert!(cached.effective_pom.is_none());
+            assert!(load_if_valid(project, fingerprint).unwrap().is_none());
+        }
+
+        save(project, "new", "new pom", "new tree", "new list").unwrap();
+        let cached = load_if_valid(project, "new").unwrap().unwrap();
+        assert_eq!(cached.effective_pom, "new pom");
+        assert_eq!(cached.verbose_tree, "new tree");
+        assert_eq!(cached.dep_list, "new list");
+    }
 
     #[test]
     fn test_save_and_load() {

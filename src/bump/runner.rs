@@ -28,6 +28,40 @@ pub struct OverrideResult {
     pub verify: Option<VerifyResult>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_failure_does_not_strand_other_mutated_poms() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked-pom.xml");
+        let recoverable = dir.path().join("recoverable-pom.xml");
+        std::fs::write(&blocked, "blocked original").unwrap();
+        std::fs::write(&recoverable, "recoverable original").unwrap();
+        let backup = MultiPomBackup::create(&[blocked.clone(), recoverable.clone()]).unwrap();
+        backup.write_mutated(&blocked, "blocked mutated").unwrap();
+        backup.write_mutated(&recoverable, "recoverable mutated").unwrap();
+        // A directory at one destination makes copy fail without permission,
+        // platform, Maven, or timing dependencies.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+
+        let error = backup.restore().unwrap_err();
+        assert!(format!("{error:#}").contains(&blocked.display().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(backup_path_for(&blocked)).unwrap(),
+            "blocked original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&recoverable).unwrap(),
+            "recoverable original",
+            "a failed restore must not leave otherwise recoverable POMs mutated"
+        );
+        assert!(!backup_path_for(&recoverable).exists());
+    }
+}
+
 const BACKUP_SUFFIX: &str = ".depintel-bump-backup";
 
 fn backup_path_for(pom: &Path) -> PathBuf {
@@ -89,17 +123,27 @@ impl MultiPomBackup {
         })
     }
 
-    /// Restore all files immediately (instead of waiting for Drop). Stops at
-    /// the first failure and returns it, leaving any un-restored files in
-    /// place with their backups so the user can recover manually.
+    /// Restore all files immediately (instead of waiting for Drop). Attempt
+    /// every file even if one fails; report the first failure and retain backups
+    /// for files that could not be restored so the user can recover manually.
     pub fn restore(mut self) -> Result<()> {
         self.active = false;
+        let mut first_error = None;
         for (pom, bkp) in &self.entries {
-            std::fs::copy(bkp, pom)
-                .with_context(|| format!("Failed to restore {}", pom.display()))?;
+            if let Err(error) = std::fs::copy(bkp, pom)
+                .with_context(|| format!("Failed to restore {}", pom.display()))
+            {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
             let _ = std::fs::remove_file(bkp);
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

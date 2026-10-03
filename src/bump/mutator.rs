@@ -101,8 +101,9 @@ pub fn try_patch_in_place(
     }
     // Check if a shared group property can be updated (e.g. ${netty.version}
     // used by netty-handler when we're bumping netty-all).
-    if let Some(prop_range) = find_shared_group_property(content, group, &index.properties)? {
-        return Ok(Some(splice_ranges(content, &[prop_range], target_version)));
+    let prop_ranges = find_shared_group_properties(content, group, &index.properties)?;
+    if !prop_ranges.is_empty() {
+        return Ok(Some(splice_ranges(content, &prop_ranges, target_version)));
     }
     Ok(None)
 }
@@ -213,8 +214,9 @@ pub fn mutate_pom_xml(
     // the properties map has it, update the property instead of injecting a new
     // dependencyManagement entry (which Maven would ignore because the property
     // wins).
-    if let Some(prop_range) = find_shared_group_property(content, group, &index.properties)? {
-        return Ok(splice_ranges(content, &[prop_range], target_version));
+    let prop_ranges = find_shared_group_properties(content, group, &index.properties)?;
+    if !prop_ranges.is_empty() {
+        return Ok(splice_ranges(content, &prop_ranges, target_version));
     }
 
     // Expand the existing empty container before using the normal insertion path.
@@ -525,16 +527,17 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
 
 /// When the target artifact (e.g. `io.netty:netty-all`) isn't declared in the POM,
 /// check if any OTHER artifact with the same groupId uses a `${property}` version.
-/// If that property exists in `<properties>`, return its byte range so the caller
-/// can splice it. This handles the common "shared version property" pattern
+/// Return all referenced local property ranges so the caller can splice them,
+/// including distinct project/profile definitions of the same property name.
+/// This handles the common "shared version property" pattern
 /// (e.g. `${netty.version}` controlling netty-handler, netty-codec, etc.).
-fn find_shared_group_property(
+fn find_shared_group_properties(
     content: &str,
     group: &str,
     properties: &PropertyRanges,
-) -> Result<Option<(usize, usize)>> {
+) -> Result<Vec<(usize, usize)>> {
     if properties.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     // Re-analyze the POM looking at ALL deps (not just the target artifact)
     // to find any in the same group that use a property reference.
@@ -606,8 +609,7 @@ fn find_shared_group_property(
         }
     }
 
-    // Return the first matching property's range.
-    Ok(found_props.first().copied())
+    Ok(found_props)
 }
 
 fn property_range(
@@ -767,6 +769,40 @@ mod tests {
     </dependencyManagement>
 </project>
 "#;
+
+    #[test]
+    fn shared_group_fallback_updates_all_referenced_scoped_properties() {
+        let pom = r#"<project>
+  <properties><v>1.0</v><unused>keep</unused></properties>
+  <dependencies><dependency><groupId>g</groupId><artifactId>root-sibling</artifactId><version>${v}</version></dependency></dependencies>
+  <profiles>
+    <profile><id>one</id>
+      <properties><v>2.0</v></properties>
+      <dependencyManagement><dependencies><dependency><groupId>g</groupId><artifactId>managed-sibling</artifactId><version>${v}</version></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile><id>two</id>
+      <dependencies><dependency><groupId>g</groupId><artifactId>direct-sibling</artifactId><version>${local}</version></dependency></dependencies>
+      <properties><local>3.0</local></properties>
+    </profile>
+    <profile><id>unrelated</id>
+      <properties><v>keep</v></properties>
+      <dependencies><dependency><groupId>other</groupId><artifactId>unrelated</artifactId><version>${v}</version></dependency></dependencies>
+    </profile>
+  </profiles>
+</project>"#;
+        let expected = pom
+            .replace("<v>1.0</v>", "<v>4&amp;preview</v>")
+            .replace("<v>2.0</v>", "<v>4&amp;preview</v>")
+            .replace("<local>3.0</local>", "<local>4&amp;preview</local>");
+        assert_eq!(
+            mutate_pom_xml(pom, "g", "absent", "4&preview").unwrap(),
+            expected
+        );
+        assert_eq!(
+            try_patch_in_place(pom, "g", "absent", "4&preview").unwrap(),
+            Some(expected)
+        );
+    }
 
     #[test]
     fn profile_version_property_updates_its_own_definition() {

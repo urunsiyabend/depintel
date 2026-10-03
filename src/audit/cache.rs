@@ -36,6 +36,14 @@ impl OsvCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn in_directory(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+        }
+    }
+
+    #[cfg(test)]
     pub fn with_ttl(mut self, seconds: u64) -> Self {
         self.ttl_seconds = seconds;
         self

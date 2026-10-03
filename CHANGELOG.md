@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.9
+
+Backward-compatible bug fixes; public commands and schemas are unchanged.
+
+### Fixed
+
+- Exclude parent coordinates and nested profile sections from effective project data.
+- Publish Maven cache validity only after output writes succeed.
+- Update all referenced scoped properties during shared-group fallback mutation.
+- Attempt restoration of every POM even if one restoration fails, retaining failed backups.
+- Enrich shared OSV advisory details separately for each package query.
+- Exclude withdrawn OSV advisories from newly fetched findings and cache entries.
+
+### Tests
+
+- Complete suite: 122 passing tests. Legacy OSV cache entries expire normally or can be refreshed with `--fresh-cves`.
+
 ## 0.1.8
 
 Backward-compatible bug fixes; commands and serialized schemas are unchanged.
