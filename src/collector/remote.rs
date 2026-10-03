@@ -154,6 +154,8 @@ pub fn fetch_pom_to_tempdir(url: &str, offline: bool) -> Result<PathBuf> {
 
 /// Parse a github.com / raw.githubusercontent.com URL into its components.
 fn parse_github_url(url: &str) -> Option<GithubRef> {
+    // Query parameters and fragment identifiers are not repository path components.
+    let url = url.split(['?', '#']).next()?;
     let stripped = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
@@ -163,7 +165,7 @@ fn parse_github_url(url: &str) -> Option<GithubRef> {
     match host {
         "raw.githubusercontent.com" => {
             // owner/repo/branch/...path
-            if parts.len() < 3 {
+            if parts.len() < 3 || parts[2].is_empty() {
                 return None;
             }
             let owner = parts[0].to_string();
@@ -196,7 +198,7 @@ fn parse_github_url(url: &str) -> Option<GithubRef> {
                 });
             }
             let kind = parts[2];
-            if (kind == "tree" || kind == "blob") && parts.len() >= 4 {
+            if (kind == "tree" || kind == "blob") && parts.len() >= 4 && !parts[3].is_empty() {
                 let branch = parts[3].to_string();
                 let sub_path = parts[4..].join("/");
                 Some(GithubRef {
@@ -310,6 +312,60 @@ mod tests {
     fn parse_github_url_strips_dot_git() {
         let r = parse_github_url("https://github.com/apache/spark.git").unwrap();
         assert_eq!(r.repo, "spark");
+    }
+
+    #[test]
+    fn parse_github_url_ignores_query_and_fragment() {
+        for (url, repo, branch, sub_path) in [
+            ("https://github.com/apache/spark?tab=readme#top", "spark", None, ""),
+            ("https://github.com/apache/spark/blob/master/core/pom.xml?raw=1#L10", "spark", Some("master"), "core/pom.xml"),
+            ("https://raw.githubusercontent.com/apache/spark/master/core/pom.xml?token=value#ignored", "spark", Some("master"), "core/pom.xml"),
+            ("https://github.com/apache/spark/tree/master#readme", "spark", Some("master"), ""),
+        ] {
+            let r = parse_github_url(url).unwrap();
+            assert_eq!(r.repo, repo, "{url}");
+            assert_eq!(r.branch.as_deref(), branch, "{url}");
+            assert_eq!(r.sub_path, sub_path, "{url}");
+        }
+    }
+
+    #[test]
+    fn empty_ref_cannot_reuse_default_branch_cache() {
+        // Use a unique owner so this fixture cannot touch a user's existing cache.
+        let fixture = tempfile::Builder::new()
+            .prefix("depintel-remote-test-")
+            .tempdir()
+            .unwrap();
+        let owner = fixture.path().file_name().unwrap().to_str().unwrap();
+        let repo = "cache-regression";
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{owner}/{repo}@").as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        let clone_dir = std::env::temp_dir()
+            .join("depintel-remote")
+            .join(&hash[..16]);
+        std::fs::create_dir_all(clone_dir.join(".git")).unwrap();
+        std::fs::write(clone_dir.join("pom.xml"), "<project/>").unwrap();
+
+        let valid = fetch_pom_to_tempdir(&format!("https://github.com/{owner}/{repo}"), true);
+        let malformed = fetch_pom_to_tempdir(
+            &format!("https://github.com/{owner}/{repo}/tree//pom.xml"),
+            true,
+        );
+        std::fs::remove_dir_all(&clone_dir).unwrap();
+        assert_eq!(valid.unwrap(), clone_dir);
+        assert!(
+            malformed.is_err(),
+            "an empty explicit ref must not reuse the default-branch POM: {malformed:?}"
+        );
+        assert!(format!("{:#}", malformed.unwrap_err()).contains("Could not parse"));
+        for url in [
+            "https://github.com/apache/spark/tree/",
+            "https://github.com/apache/spark/blob//pom.xml",
+            "https://raw.githubusercontent.com/apache/spark//pom.xml",
+        ] {
+            assert!(parse_github_url(url).is_none(), "{url}");
+        }
     }
 
     #[test]

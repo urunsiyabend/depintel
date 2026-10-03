@@ -117,11 +117,17 @@ pub fn discover_module_poms(root_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut visited: HashSet<PathBuf> = HashSet::new();
     let mut stack: Vec<PathBuf> = vec![root_dir.to_path_buf()];
 
-    while let Some(dir) = stack.pop() {
-        let pom = dir.join("pom.xml");
+    while let Some(path) = stack.pop() {
+        // Maven modules may name either a directory or a specific POM file.
+        let pom = if path.is_dir() {
+            path.join("pom.xml")
+        } else {
+            path
+        };
         if !pom.exists() {
             continue;
         }
+        let dir = pom.parent().unwrap_or_else(|| Path::new("."));
         let canonical = std::fs::canonicalize(&pom).unwrap_or_else(|_| pom.clone());
         if !visited.insert(canonical) {
             continue;
@@ -137,13 +143,7 @@ pub fn discover_module_poms(root_dir: &Path) -> Result<Vec<PathBuf>> {
         };
         out.push(pom.clone());
         for module_rel in parse_module_declarations(&content) {
-            // Maven treats `<module>foo</module>` as a sibling directory that
-            // contains its own pom.xml. Strip any trailing `/pom.xml` some
-            // projects write by mistake.
-            let rel = module_rel
-                .trim_end_matches("/pom.xml")
-                .trim_end_matches("\\pom.xml");
-            stack.push(dir.join(rel));
+            stack.push(dir.join(module_rel));
         }
     }
     Ok(out)
@@ -1401,6 +1401,37 @@ mod tests {
         let r = try_patch_in_place(pom, "g", "a", "2.5.0").unwrap().unwrap();
         assert!(r.contains("<version>2.5.0</version>"), "got:\n{}", r);
         assert!(!r.contains("1.0.0"), "got:\n{}", r);
+    }
+
+    #[test]
+    fn discover_module_poms_follows_explicit_pom_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let child_dir = root.join("child");
+        std::fs::create_dir(&child_dir).unwrap();
+        let root_pom = root.join("pom.xml");
+        let custom_pom = child_dir.join("pom-custom.xml");
+        let nested_pom = child_dir.join("nested.xml");
+        std::fs::write(
+            &root_pom,
+            "<project><modules><module>child/pom-custom.xml</module><module>child/pom-custom.xml</module></modules></project>",
+        ).unwrap();
+        std::fs::write(
+            &custom_pom,
+            "<project><modules><module>nested.xml</module></modules></project>",
+        )
+        .unwrap();
+        std::fs::write(
+            &nested_pom,
+            "<project><modules><module>../pom.xml</module></modules></project>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_module_poms(root).unwrap(),
+            vec![root_pom, custom_pom, nested_pom],
+            "explicit module POM paths must be traversed relative to their parent directory",
+        );
     }
 
     #[test]

@@ -493,6 +493,91 @@ mod tests {
     }
 
     #[test]
+    fn legacy_coordinate_cache_is_refetched_before_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OsvCache::in_directory(dir.path().to_path_buf());
+        let queries = vec![OsvQuery {
+            group: "org.example".into(),
+            artifact: "lib".into(),
+            version: "1.0".into(),
+        }];
+        let legacy = Vulnerability {
+            id: "GHSA-withdrawn".into(),
+            aliases: vec![],
+            summary: "Legacy withdrawn finding".into(),
+            severity: VulnSeverity::Critical,
+            cvss_score: None,
+            fixed_versions: vec!["99.0".into()],
+            sources: vec!["GHSA".into()],
+        };
+        cache.put(&queries[0].cache_key(), &[legacy]).unwrap();
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        entry.as_object_mut().unwrap().remove("schema_version");
+        std::fs::write(&path, entry.to_string()).unwrap();
+        let client = OsvClient::new(cache);
+        let (base, server) = fixture_server(vec![
+            (
+                "POST /querybatch ",
+                serde_json::json!({"results": [{"vulns": [
+                    {"id": "GHSA-withdrawn"}, {"id": "GHSA-active"}
+                ]}]}),
+            ),
+            (
+                "GET /vulns/GHSA-withdrawn ",
+                serde_json::json!({
+                    "id": "GHSA-withdrawn", "withdrawn": "2024-01-01T00:00:00Z"
+                }),
+            ),
+            (
+                "GET /vulns/GHSA-active ",
+                serde_json::json!({
+                    "id": "GHSA-active", "database_specific": {"severity": "LOW"},
+                    "affected": [
+                        {"package": {"ecosystem": "Maven", "name": "org.example:other"},
+                         "ranges": [{"events": [{"fixed": "99.0"}]}]},
+                        {"package": {"ecosystem": "Maven", "name": "org.example:lib"},
+                         "ranges": [{"events": [{"fixed": "1.1"}]}]},
+                        {"package": {"ecosystem": "npm", "name": "org.example:lib"},
+                         "ranges": [{"events": [{"fixed": "88.0"}]}]}
+                    ]
+                }),
+            ),
+        ]);
+        let results = client
+            .query_batch_at(
+                &queries,
+                &format!("{base}/querybatch"),
+                &format!("{base}/vulns/"),
+            )
+            .unwrap();
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].id, "GHSA-active");
+        assert_eq!(results[0][0].fixed_versions, vec!["1.1"]);
+        server.join().unwrap();
+        // Rewritten entries must be hits, including for the report's real query.
+        let trees = crate::collector::verbose_tree::parse_verbose_tree(
+            "[INFO] org.fixture:app:jar:1.0\n[INFO] \\- org.example:lib:jar:1.0:compile",
+        )
+        .unwrap();
+        let graph = crate::graph::builder::build_graph(&trees[0]);
+        let report = crate::audit::report::build_report(&graph, &client, false).unwrap();
+        assert_eq!(report.summary.critical, 0);
+        assert_eq!(report.summary.low, 1);
+        let output = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            output["findings"][0]["vulnerabilities"][0]["fixed_versions"],
+            serde_json::json!(["1.1"])
+        );
+    }
+
+    #[test]
     fn shared_advisory_keeps_fixed_versions_scoped_per_package() {
         let dir = tempfile::tempdir().unwrap();
         let client = OsvClient::new(OsvCache::in_directory(dir.path().to_path_buf()));

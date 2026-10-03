@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.10
+
+Backward-compatible bug fixes; public commands and report schemas are unchanged.
+
+### Fixed
+
+- Invalidate unversioned or incompatible OSV cache entries so legacy advisory results are refetched with current filtering.
+- Refuse backup symlink collisions and atomically reserve private backup files without overwriting existing recovery data; clean up partial backup creation.
+- Discover explicitly named module POM files as well as module directories, retaining cycle protection.
+- Ignore query strings and fragments when parsing GitHub POM URLs.
+- Reject empty explicit GitHub refs before cache lookup, avoiding default-branch cache collisions.
+
+### Tests
+
+- Complete suite: 133 passing tests, including offline fixtures for cache migration, backup recovery and creation-time permissions.
+
 ## 0.1.9
 
 Backward-compatible bug fixes; public commands and schemas are unchanged.

@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::audit::osv::Vulnerability;
 
 const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60; // 24h
+                                               // Enriched results omit the raw data needed to recheck withdrawal/package scope.
+                                               // Invalidate older results when enrichment semantics change.
+const CACHE_SCHEMA_VERSION: u32 = 1;
 
 /// Disk-backed cache for OSV vulnerability lookups, keyed by `group:artifact:version`.
 /// One JSON file per coordinate. Lives in the user's cache dir so it's shared across projects.
@@ -17,6 +20,8 @@ pub struct OsvCache {
 
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
+    #[serde(default)]
+    schema_version: u32,
     fetched_at: u64,
     vulns: Vec<Vulnerability>,
 }
@@ -70,7 +75,9 @@ impl OsvCache {
             Ok(e) => e,
             Err(_) => return Ok(None), // corrupt entry — treat as miss
         };
-        if now_unix().saturating_sub(entry.fetched_at) >= self.ttl_seconds {
+        if entry.schema_version != CACHE_SCHEMA_VERSION
+            || now_unix().saturating_sub(entry.fetched_at) >= self.ttl_seconds
+        {
             return Ok(None);
         }
         Ok(Some(entry.vulns))
@@ -80,6 +87,7 @@ impl OsvCache {
     /// to ignore them, but cache failure shouldn't be fatal in audit flows.
     pub fn put(&self, key: &str, vulns: &[Vulnerability]) -> Result<()> {
         let entry = CacheEntry {
+            schema_version: CACHE_SCHEMA_VERSION,
             fetched_at: now_unix(),
             vulns: vulns.to_vec(),
         };
@@ -165,6 +173,24 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "GHSA-test");
         assert_eq!(loaded[0].severity, VulnSeverity::High);
+    }
+
+    #[test]
+    fn legacy_entries_are_misses_even_when_fresh() {
+        let (_dir, cache) = temp_cache();
+        let key = "g:a:1.0.0";
+        // Prior releases persisted enriched results without a schema marker.
+        // They cannot be revalidated: withdrawn and affected-package data is gone.
+        let legacy = serde_json::json!({
+            "fetched_at": now_unix(),
+            "vulns": [{
+                "id": "GHSA-legacy", "aliases": [], "summary": "Legacy result",
+                "severity": "Critical", "cvss_score": null,
+                "fixed_versions": ["unrelated-package-fix"], "sources": ["GHSA"]
+            }]
+        });
+        std::fs::write(cache.path_for(key), legacy.to_string()).unwrap();
+        assert!(cache.get(key).unwrap().is_none());
     }
 
     #[test]

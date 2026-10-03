@@ -32,6 +32,154 @@ pub struct OverrideResult {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn backup_reservation_is_private_before_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "DEPINTEL_BACKUP_PERMISSION_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Isolate umask from the parallel test process. A restrictive
+            // inherited umask must not accidentally hide an unsafe creation mode.
+            let output = Command::new("sh")
+                .args(["-c", "umask 022; exec \"$@\"", "backup-permission-test"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "bump::runner::tests::backup_reservation_is_private_before_copy",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "creation-time permission regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup_path = dir.path().join("pom.xml.depintel-bump-backup");
+        let destination = reserve_backup(&backup_path).unwrap();
+        // Inspect the same helper used by create(), before content is copied
+        // or source permissions are applied; a post-copy chmod cannot pass.
+        let metadata = destination.metadata().unwrap();
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "backup must be owner-only from the instant it is reserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_creation_preserves_source_permissions_after_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pom = dir.path().join("pom.xml");
+        for mode in [0o600, 0o640, 0o644] {
+            std::fs::write(&pom, "private pom content").unwrap();
+            std::fs::set_permissions(&pom, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let backup = MultiPomBackup::create(&[pom.clone()]).unwrap();
+            let backup_path = backup_path_for(&pom);
+            assert_eq!(
+                std::fs::metadata(&backup_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "completed backup must retain the source permissions"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&backup_path).unwrap(),
+                "private pom content"
+            );
+            backup.restore().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_creation_refuses_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let pom = dir.path().join("pom.xml");
+        let target = dir.path().join("unrelated.xml");
+        std::fs::write(&pom, "original").unwrap();
+        let backup_path = backup_path_for(&pom);
+        std::os::unix::fs::symlink(&target, &backup_path).unwrap();
+
+        let result = MultiPomBackup::create(&[pom.clone()]);
+        assert!(
+            result.is_err(),
+            "an existing backup symlink must not be followed"
+        );
+        assert!(
+            !target.exists(),
+            "backup creation wrote through an unrelated symlink"
+        );
+        assert_eq!(std::fs::read_link(&backup_path).unwrap(), target);
+        assert_eq!(std::fs::read_to_string(&pom).unwrap(), "original");
+    }
+
+    #[test]
+    fn backup_creation_rejects_duplicate_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let pom = dir.path().join("pom.xml");
+        std::fs::write(&pom, "original").unwrap();
+        let result = MultiPomBackup::create(&[pom.clone(), pom.clone()]);
+        assert!(
+            result.is_err(),
+            "a backup must never overwrite an existing destination"
+        );
+        assert!(!backup_path_for(&pom).exists());
+        assert_eq!(std::fs::read_to_string(&pom).unwrap(), "original");
+    }
+
+    #[test]
+    fn backup_creation_cleans_up_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let pom = dir.path().join("pom.xml");
+        let unreadable_source = dir.path().join("directory.xml");
+        std::fs::write(&pom, "original").unwrap();
+        std::fs::create_dir(&unreadable_source).unwrap();
+
+        assert!(MultiPomBackup::create(&[pom.clone(), unreadable_source.clone()]).is_err());
+        assert!(
+            !backup_path_for(&pom).exists(),
+            "completed backup was not removed"
+        );
+        assert!(
+            !backup_path_for(&unreadable_source).exists(),
+            "partial backup was not removed"
+        );
+        assert_eq!(std::fs::read_to_string(&pom).unwrap(), "original");
+    }
+
+    #[test]
+    fn dropping_backup_restores_all_mutated_poms() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.xml");
+        let second = dir.path().join("second.xml");
+        std::fs::write(&first, "first original").unwrap();
+        std::fs::write(&second, "second original").unwrap();
+        {
+            let backup = MultiPomBackup::create(&[first.clone(), second.clone()]).unwrap();
+            backup.write_mutated(&first, "first mutated").unwrap();
+            backup.write_mutated(&second, "second mutated").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first original");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second original");
+        assert!(!backup_path_for(&first).exists());
+        assert!(!backup_path_for(&second).exists());
+    }
+
     #[test]
     fn restore_failure_does_not_strand_other_mutated_poms() {
         let dir = tempfile::tempdir().unwrap();
@@ -41,7 +189,9 @@ mod tests {
         std::fs::write(&recoverable, "recoverable original").unwrap();
         let backup = MultiPomBackup::create(&[blocked.clone(), recoverable.clone()]).unwrap();
         backup.write_mutated(&blocked, "blocked mutated").unwrap();
-        backup.write_mutated(&recoverable, "recoverable mutated").unwrap();
+        backup
+            .write_mutated(&recoverable, "recoverable mutated")
+            .unwrap();
         // A directory at one destination makes copy fail without permission,
         // platform, Maven, or timing dependencies.
         std::fs::remove_file(&blocked).unwrap();
@@ -70,6 +220,19 @@ fn backup_path_for(pom: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn reserve_backup(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Restrict access atomically at creation, before copying private data.
+        // Source permissions are applied only after the copy completes.
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// RAII guard that restores one or more `pom.xml` files from sibling backups
 /// when dropped. Used for multi-module projects where a bump may touch several
 /// pom.xml files at once — all of them must be restored atomically on any
@@ -87,7 +250,7 @@ impl MultiPomBackup {
         // spraying mutations across modules.
         for pom in pom_files {
             let bkp = backup_path_for(pom);
-            if bkp.exists() {
+            if bkp.symlink_metadata().is_ok() {
                 anyhow::bail!(
                     "A leftover backup already exists at {}.\n\
                      This usually means a previous `depintel bump` run was interrupted before it could restore the original pom.xml.\n\
@@ -101,8 +264,19 @@ impl MultiPomBackup {
         let mut entries: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(pom_files.len());
         for pom in pom_files {
             let bkp = backup_path_for(pom);
-            if let Err(e) = std::fs::copy(pom, &bkp) {
-                // Roll back any backups we've already created before bailing.
+            let result = (|| -> std::io::Result<()> {
+                let mut source = std::fs::File::open(pom)?;
+                // Reserve the destination atomically: pre-flight alone cannot
+                // prevent concurrent runs or symlinks from clobbering a backup.
+                let mut destination = reserve_backup(&bkp)?;
+                // Track it immediately so a failed copy removes partial output.
+                entries.push((pom.clone(), bkp.clone()));
+                std::io::copy(&mut source, &mut destination)?;
+                destination.set_permissions(source.metadata()?.permissions())?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                // Roll back only destinations this invocation created.
                 for (_, done) in &entries {
                     let _ = std::fs::remove_file(done);
                 }
@@ -110,17 +284,18 @@ impl MultiPomBackup {
                     format!("Failed to back up {} to {}", pom.display(), bkp.display())
                 });
             }
-            entries.push((pom.clone(), bkp));
         }
 
-        Ok(Self { entries, active: true })
+        Ok(Self {
+            entries,
+            active: true,
+        })
     }
 
     /// Overwrite a specific pom file with new content.
     pub fn write_mutated(&self, pom_path: &Path, content: &str) -> Result<()> {
-        std::fs::write(pom_path, content).with_context(|| {
-            format!("Failed to write mutated pom.xml to {}", pom_path.display())
-        })
+        std::fs::write(pom_path, content)
+            .with_context(|| format!("Failed to write mutated pom.xml to {}", pom_path.display()))
     }
 
     /// Restore all files immediately (instead of waiting for Drop). Attempt
@@ -189,7 +364,10 @@ pub fn collect_with_override(
 ) -> Result<OverrideResult> {
     // Discover every reachable pom.xml in the reactor.
     let module_poms = discover_module_poms(pom_dir).with_context(|| {
-        format!("Failed to enumerate module poms under {}", pom_dir.display())
+        format!(
+            "Failed to enumerate module poms under {}",
+            pom_dir.display()
+        )
     })?;
     if module_poms.is_empty() {
         anyhow::bail!("No pom.xml found under {}", pom_dir.display());
@@ -268,7 +446,9 @@ pub fn collect_with_override(
                             let combined = format!("{}\n{}", stdout, stderr);
                             let truncated: String = combined
                                 .lines()
-                                .filter(|l| l.contains("[ERROR]") || l.contains("COMPILATION ERROR"))
+                                .filter(|l| {
+                                    l.contains("[ERROR]") || l.contains("COMPILATION ERROR")
+                                })
                                 .take(20)
                                 .collect::<Vec<_>>()
                                 .join("\n");
