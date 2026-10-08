@@ -72,6 +72,11 @@ impl ElementStack {
             .enumerate()
             .all(|(i, &want)| self.elements[offset + i] == want)
     }
+    /// True when the current element is a direct child of `<dependency>`.
+    fn is_dependency_field(&self) -> bool {
+        let n = self.elements.len();
+        n >= 2 && self.elements[n - 2] == "dependency"
+    }
 }
 
 /// Try to patch an existing `<dependency>` or `<dependencyManagement>` entry
@@ -467,7 +472,9 @@ fn analyze_pom(content: &str, group: &str, artifact: &str) -> Result<PomIndex> {
 
                 // --- 1. dependency fields ---
                 if let Some(ref mut dep) = current_dep {
-                    if !trimmed.is_empty() {
+                    // Only direct children identify the dependency; nested
+                    // <exclusion> coordinates name other artifacts.
+                    if !trimmed.is_empty() && stack.is_dependency_field() {
                         if let Some(leaf) = stack.elements.last() {
                             match leaf.as_str() {
                                 "groupId" => dep.group_id = Some(trimmed.clone()),
@@ -592,7 +599,7 @@ fn find_shared_group_properties(
                 if let Some(ref mut dep) = current {
                     let text = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
                     let trimmed = text.trim().to_string();
-                    if !trimmed.is_empty() {
+                    if !trimmed.is_empty() && stack.is_dependency_field() {
                         if let Some(leaf) = stack.elements.last() {
                             match leaf.as_str() {
                                 "groupId" => dep.group_id = Some(trimmed),
@@ -1401,6 +1408,50 @@ mod tests {
         let r = try_patch_in_place(pom, "g", "a", "2.5.0").unwrap().unwrap();
         assert!(r.contains("<version>2.5.0</version>"), "got:\n{}", r);
         assert!(!r.contains("1.0.0"), "got:\n{}", r);
+    }
+
+    #[test]
+    fn exclusion_coordinates_do_not_identify_their_parent_dependency() {
+        let pom = r#"<project>
+  <properties><spring.version>5.3.0</spring.version></properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-core</artifactId>
+      <version>${spring.version}</version>
+      <exclusions>
+        <exclusion><groupId>commons-logging</groupId><artifactId>commons-logging</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>"#;
+        // Bumping the excluded artifact must not rewrite the excluding dependency.
+        assert!(
+            try_patch_in_place(pom, "commons-logging", "commons-logging", "1.3.0")
+                .unwrap()
+                .is_none()
+        );
+        let out = mutate_pom_xml(pom, "commons-logging", "commons-logging", "1.3.0").unwrap();
+        assert!(
+            out.contains("<spring.version>5.3.0</spring.version>"),
+            "got:\n{out}"
+        );
+
+        // The declaring dependency itself is still found despite its exclusions.
+        let out = try_patch_in_place(pom, "org.springframework", "spring-core", "5.3.39")
+            .unwrap()
+            .expect("spring-core is declared");
+        assert!(
+            out.contains("<spring.version>5.3.39</spring.version>"),
+            "got:\n{out}"
+        );
+
+        // The shared-group fallback must likewise ignore exclusion groupIds.
+        assert!(
+            try_patch_in_place(pom, "commons-logging", "commons-logging-api", "1.3.0")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

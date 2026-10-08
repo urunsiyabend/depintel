@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.11
+
+Backward-compatible bug fixes; public commands and report schemas are unchanged.
+
+### Fixed
+
+- Ignore `<exclusions>` coordinates when locating the dependency to bump, so bumping an excluded artifact no longer rewrites the excluding dependency's version and dependencies with exclusions are patched in place.
+- Ignore exclusion coordinates and require both coordinates to come from one entry when choosing a bump fix strategy.
+- Avoid out-of-bounds panics and misplaced property lookups in fix-strategy analysis of POMs containing non-ASCII text whose lowercase form changes byte length.
+- Include explicitly named module POM files (for example `child/pom-custom.xml`) in the Maven cache fingerprint so edits invalidate cached data; fingerprints for conventional `pom.xml` layouts are unchanged.
+
+### Tests
+
+- Complete suite: 139 passing tests, including five RED/GREEN regression tests for the fixes above and a fingerprint compatibility guard.
+
 ## 0.1.10
 
 Backward-compatible bug fixes; public commands and report schemas are unchanged.

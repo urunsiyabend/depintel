@@ -111,13 +111,20 @@ pub fn analyze_fix_strategy(
 /// Search for a `<dependency>` block matching group:artifact where the version
 /// uses a property reference like `${some.property}`. Returns the property name.
 fn find_property_version(content: &str, group: &str, artifact: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let group_tag = format!("<groupid>{}</groupid>", group.to_lowercase());
-    let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_lowercase());
+    // ASCII lowercasing keeps byte offsets valid for slicing `content`.
+    let lower = content.to_ascii_lowercase();
+    dependency_blocks(&lower)
+        .into_iter()
+        // Both groupId AND artifactId must be in this specific <dependency> block
+        .filter(|&(start, end)| block_declares(&lower[start..end], group, artifact))
+        .find_map(|(start, end)| extract_property_ref(&content[start..end]))
+}
 
-    // Find each <dependency>...</dependency> block and check if it matches
+/// Byte ranges of every `<dependency>...</dependency>` block in lowercased content.
+fn dependency_blocks(lower: &str) -> Vec<(usize, usize)> {
     let dep_open = "<dependency>";
     let dep_close = "</dependency>";
+    let mut blocks = Vec::new();
     let mut search_from = 0;
     while let Some(dstart) = lower[search_from..].find(dep_open) {
         let abs_dstart = search_from + dstart;
@@ -126,23 +133,33 @@ fn find_property_version(content: &str, group: &str, artifact: &str) -> Option<S
             Some(e) => block_body_start + e,
             None => break,
         };
-
-        let block_lower = &lower[abs_dstart..abs_dend];
-        // Both groupId AND artifactId must be in this specific <dependency> block
-        if block_lower.contains(&group_tag) && block_lower.contains(&artifact_tag) {
-            let block_original = &content[abs_dstart..abs_dend];
-            if let Some(prop) = extract_property_ref(block_original) {
-                return Some(prop);
-            }
-        }
+        blocks.push((abs_dstart, abs_dend));
         search_from = abs_dend + dep_close.len();
     }
-    None
+    blocks
+}
+
+/// Whether a lowercased `<dependency>` block declares group:artifact itself.
+/// Coordinates inside `<exclusions>` name other artifacts and are ignored.
+fn block_declares(block_lower: &str, group: &str, artifact: &str) -> bool {
+    let mut own = block_lower.to_string();
+    while let Some(start) = own.find("<exclusions>") {
+        match own[start..].find("</exclusions>") {
+            Some(end) => own.replace_range(start..start + end + "</exclusions>".len(), ""),
+            None => {
+                own.truncate(start);
+                break;
+            }
+        }
+    }
+    let group_tag = format!("<groupid>{}</groupid>", group.to_ascii_lowercase());
+    let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_ascii_lowercase());
+    own.contains(&group_tag) && own.contains(&artifact_tag)
 }
 
 /// Extract a property name from `<version>${prop.name}</version>`.
 fn extract_property_ref(region: &str) -> Option<String> {
-    let lower = region.to_lowercase();
+    let lower = region.to_ascii_lowercase();
     let mut pos = 0;
     while let Some(vstart) = lower[pos..].find("<version>") {
         let abs = pos + vstart + "<version>".len();
@@ -160,47 +177,25 @@ fn extract_property_ref(region: &str) -> Option<String> {
 /// Check if a POM has a direct `<dependency>` (not in `<dependencyManagement>`)
 /// for the given group:artifact.
 fn has_direct_dependency(content: &str, group: &str, artifact: &str) -> bool {
-    let lower = content.to_lowercase();
-    let group_tag = format!("<groupid>{}</groupid>", group.to_lowercase());
-    let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_lowercase());
+    let lower = content.to_ascii_lowercase();
 
     // Find the dependencyManagement region to exclude
     let mgmt_start = lower.find("<dependencymanagement>");
     let mgmt_end = lower.find("</dependencymanagement>");
 
-    let dep_open = "<dependency>";
-    let dep_close = "</dependency>";
-    let mut search_from = 0;
-    while let Some(dstart) = lower[search_from..].find(dep_open) {
-        let abs_dstart = search_from + dstart;
-        let block_body_start = abs_dstart + dep_open.len();
-        let abs_dend = match lower[block_body_start..].find(dep_close) {
-            Some(e) => block_body_start + e,
-            None => break,
-        };
-
+    dependency_blocks(&lower).into_iter().any(|(start, end)| {
         // Skip if inside dependencyManagement
         let in_mgmt = match (mgmt_start, mgmt_end) {
-            (Some(s), Some(e)) => abs_dstart > s && abs_dstart < e,
+            (Some(s), Some(e)) => start > s && start < e,
             _ => false,
         };
-
-        if !in_mgmt {
-            let block = &lower[abs_dstart..abs_dend];
-            if block.contains(&group_tag) && block.contains(&artifact_tag) {
-                return true;
-            }
-        }
-        search_from = abs_dend + dep_close.len();
-    }
-    false
+        !in_mgmt && block_declares(&lower[start..end], group, artifact)
+    })
 }
 
 /// Check if a POM has this artifact in `<dependencyManagement>`.
 fn has_managed_dependency(content: &str, group: &str, artifact: &str) -> bool {
-    let lower = content.to_lowercase();
-    let group_tag = format!("<groupid>{}</groupid>", group.to_lowercase());
-    let artifact_tag = format!("<artifactid>{}</artifactid>", artifact.to_lowercase());
+    let lower = content.to_ascii_lowercase();
 
     let mgmt_start = match lower.find("<dependencymanagement>") {
         Some(s) => s,
@@ -211,8 +206,12 @@ fn has_managed_dependency(content: &str, group: &str, artifact: &str) -> bool {
         None => return false,
     };
 
-    let mgmt_region = &lower[mgmt_start..mgmt_end];
-    mgmt_region.contains(&group_tag) && mgmt_region.contains(&artifact_tag)
+    // Both coordinates must belong to the same managed entry.
+    dependency_blocks(&lower).into_iter().any(|(start, end)| {
+        start > mgmt_start
+            && start < mgmt_end
+            && block_declares(&lower[start..end], group, artifact)
+    })
 }
 
 #[cfg(test)]
@@ -294,6 +293,89 @@ mod tests {
 
         let prop = find_property_version(pom, "io.netty", "netty-handler");
         assert_eq!(prop, Some("netty.version".to_string()));
+    }
+
+    #[test]
+    fn exclusions_do_not_match_the_excluding_dependency() {
+        let pom = r#"
+        <project>
+          <dependencies>
+            <dependency>
+              <groupId>org.springframework</groupId>
+              <artifactId>spring-core</artifactId>
+              <version>${spring.version}</version>
+              <exclusions>
+                <exclusion>
+                  <groupId>commons-logging</groupId>
+                  <artifactId>commons-logging</artifactId>
+                </exclusion>
+              </exclusions>
+            </dependency>
+          </dependencies>
+        </project>
+        "#;
+        assert_eq!(
+            find_property_version(pom, "commons-logging", "commons-logging"),
+            None
+        );
+        assert!(!has_direct_dependency(
+            pom,
+            "commons-logging",
+            "commons-logging"
+        ));
+        assert_eq!(
+            find_property_version(pom, "org.springframework", "spring-core"),
+            Some("spring.version".to_string())
+        );
+    }
+
+    #[test]
+    fn non_ascii_text_does_not_shift_property_offsets() {
+        // 'İ' lowercases to two chars with a different UTF-8 length.
+        let pom = format!(
+            r#"
+        <project>
+          <name>{}</name>
+          <dependencies>
+            <dependency>
+              <groupId>com.fasterxml.jackson.core</groupId>
+              <artifactId>jackson-databind</artifactId>
+              <version>${{jackson.version}}</version>
+            </dependency>
+          </dependencies>
+        </project>
+        "#,
+            "İ".repeat(200)
+        );
+        let pom = pom.as_str();
+        assert_eq!(
+            find_property_version(pom, "com.fasterxml.jackson.core", "jackson-databind"),
+            Some("jackson.version".to_string())
+        );
+    }
+
+    #[test]
+    fn managed_coordinates_must_come_from_one_entry() {
+        let pom = r#"
+        <project>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>failureaccess</artifactId>
+                <version>1.0.2</version>
+              </dependency>
+              <dependency>
+                <groupId>org.other</groupId>
+                <artifactId>guava</artifactId>
+                <version>1.0</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+        </project>
+        "#;
+        assert!(!has_managed_dependency(pom, "com.google.guava", "guava"));
+        assert!(has_managed_dependency(pom, "org.other", "guava"));
     }
 
     #[test]
