@@ -42,6 +42,11 @@ pub fn collect_or_cache(
     fresh: bool,
     offline: bool,
 ) -> Result<(String, String, String)> {
+    if fresh && offline {
+        // Fail before invalidating: --offline may depend on this cache later.
+        anyhow::bail!("Cannot use --fresh and --offline together");
+    }
+
     if fresh {
         store::invalidate(pom_dir)?;
     }
@@ -121,10 +126,6 @@ pub fn collect_or_cache(
 
         Ok((effective_pom, verbose_tree, dep_list))
     } else {
-        if offline {
-            anyhow::bail!("Cannot use --fresh and --offline together");
-        }
-
         let output = maven::collect(pom_dir, goals)?;
         let fp = fingerprint::compute_fingerprint(pom_dir)?;
 
@@ -137,5 +138,26 @@ pub fn collect_or_cache(
         )?;
 
         Ok((output.effective_pom, output.verbose_tree, output.dep_list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_offline_error_keeps_existing_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        store::save(dir.path(), "fingerprint", "pom", "tree", "list").unwrap();
+        let goals = CollectGoals {
+            effective_pom: false,
+            verbose_tree: true,
+            dep_list: false,
+        };
+        assert!(collect_or_cache(dir.path(), goals, true, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".depintel/verbose-tree.txt")).unwrap(),
+            "tree"
+        );
     }
 }

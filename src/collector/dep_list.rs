@@ -56,6 +56,12 @@ fn parse_dep_entry(line: &str) -> Option<DepListEntry> {
     // Strip trailing metadata like " -- module org.foo.bar"
     let line = line.split(" -- ").next().unwrap_or(line).trim();
 
+    // maven-dependency-plugin marks optional dependencies after the scope.
+    let (line, optional) = match line.strip_suffix("(optional)") {
+        Some(rest) => (rest.trim_end(), true),
+        None => (line, false),
+    };
+
     // Possible formats:
     //   group:artifact:type:version:scope
     //   group:artifact:type:classifier:version:scope
@@ -69,7 +75,7 @@ fn parse_dep_entry(line: &str) -> Option<DepListEntry> {
                     key: ArtifactKey::new(parts[0], parts[1]),
                     version: parts[3].to_string(),
                     scope: Scope::parse(parts[4]),
-                    optional: false,
+                    optional,
                     classifier: None,
                     packaging: parts[2].to_string(),
                 },
@@ -82,7 +88,7 @@ fn parse_dep_entry(line: &str) -> Option<DepListEntry> {
                     key: ArtifactKey::new(parts[0], parts[1]),
                     version: parts[4].to_string(),
                     scope: Scope::parse(parts[5]),
-                    optional: false,
+                    optional,
                     classifier: Some(parts[3].to_string()),
                     packaging: parts[2].to_string(),
                 },
@@ -147,5 +153,23 @@ The following files have been resolved:
         let entries = parse_dep_list(input).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].artifact.key.artifact_id, "commons-lang3");
+    }
+
+    #[test]
+    fn test_parse_dep_list_optional_marker_keeps_scope() {
+        let input = "   org.foo:rt:jar:1.0:runtime (optional)\n\
+                     \x20  org.foo:prov:jar:1.0:provided (optional) -- module org.foo.prov\n\
+                     \x20  org.foo:cls:jar:linux:1.0:test (optional)\n\
+                     \x20  org.foo:plain:jar:1.0:runtime\n";
+        let entries = parse_dep_list(input).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].artifact.scope, Scope::Runtime);
+        assert!(entries[0].artifact.optional);
+        assert_eq!(entries[1].artifact.scope, Scope::Provided);
+        assert!(entries[1].artifact.optional);
+        assert_eq!(entries[2].artifact.scope, Scope::Test);
+        assert!(entries[2].artifact.optional);
+        assert_eq!(entries[3].artifact.scope, Scope::Runtime);
+        assert!(!entries[3].artifact.optional);
     }
 }
