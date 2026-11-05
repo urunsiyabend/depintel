@@ -126,7 +126,7 @@ pub fn detect_conflicts(
                 let gap = (sel_parsed.1 as i32 - ov_parsed.1 as i32).unsigned_abs();
                 max_minor_gap = max_minor_gap.max(gap);
                 VersionJump::Minor
-            } else if sel_parsed.2 != ov_parsed.2 {
+            } else if sel_parsed.2 != ov_parsed.2 || sel_parsed.3 != ov_parsed.3 {
                 VersionJump::Patch
             } else {
                 VersionJump::None
@@ -299,15 +299,18 @@ fn determine_resolution_label(requests: &[VersionRequest], selected_version: &st
     }
 }
 
-fn parse_semver(version: &str) -> (u32, u32, u32) {
-    let parts: Vec<&str> = version.split('.').collect();
-    let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts
-        .get(2)
-        .and_then(|s| s.split('-').next().and_then(|n| n.parse().ok()))
-        .unwrap_or(0);
-    (major, minor, patch)
+/// Parse a version string into (major, minor, patch, build). Best effort: each
+/// segment contributes its leading digits, so 31.1-jre parses as (31, 1, 0, 0).
+pub(crate) fn parse_semver(version: &str) -> (u32, u32, u32, u32) {
+    let mut parts = version.split('.').map(|part| {
+        let digits = part.len() - part.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        part[..digits].parse().unwrap_or(0)
+    });
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    let build = parts.next().unwrap_or(0);
+    (major, minor, patch, build)
 }
 
 #[cfg(test)]
@@ -440,5 +443,40 @@ mod tests {
         let reports = detect_conflicts(&graph, &[]);
 
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn qualified_minor_versions_are_compared_numerically() {
+        let input = r#"com.test:app:jar:1.0.0
++- com.google.guava:guava:jar:31.0-jre:compile
+\- org.other:lib:jar:1.0:compile
+   \- (com.google.guava:guava:jar:31.1-jre:compile - omitted for conflict with 31.0-jre)"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let reports = detect_conflicts(&graph, &[]);
+        assert_eq!(reports[0].version_jump, VersionJump::Minor);
+        assert!(reports[0].is_downgrade, "31.0-jre is older than 31.1-jre");
+    }
+
+    #[test]
+    fn qualified_major_only_versions_are_compared_numerically() {
+        assert_eq!(parse_semver("32-jre"), (32, 0, 0, 0));
+        assert_eq!(parse_semver("31.1-jre"), (31, 1, 0, 0));
+        assert_eq!(parse_semver("5.3.RELEASE"), (5, 3, 0, 0));
+        assert_eq!(parse_semver("1.2.3.Final"), (1, 2, 3, 0));
+        assert_eq!(parse_semver("2.9.10.8"), (2, 9, 10, 8));
+    }
+
+    #[test]
+    fn fourth_numeric_segment_is_a_version_difference() {
+        let input = r#"com.test:app:jar:1.0.0
++- com.fasterxml.jackson.core:jackson-databind:jar:2.9.10.1:compile
+\- org.other:lib:jar:1.0:compile
+   \- (com.fasterxml.jackson.core:jackson-databind:jar:2.9.10.8:compile - omitted for conflict with 2.9.10.1)"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let reports = detect_conflicts(&graph, &[]);
+        assert_eq!(reports[0].version_jump, VersionJump::Patch);
+        assert!(reports[0].is_downgrade);
     }
 }

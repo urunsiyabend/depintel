@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::collector::effective_pom::ManagedDependency;
 use crate::graph::builder::{DepGraph, VersionRequest};
+use crate::graph::conflict::parse_semver;
 use crate::model::ArtifactKey;
 
 /// Result of a "why" query for a single module.
@@ -424,18 +425,6 @@ fn generate_warnings(
     warnings
 }
 
-/// Parse a version string into (major, minor, patch). Best effort.
-fn parse_semver(version: &str) -> (u32, u32, u32) {
-    let parts: Vec<&str> = version.split('.').collect();
-    let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts
-        .get(2)
-        .and_then(|s| s.split('-').next().and_then(|n| n.parse().ok()))
-        .unwrap_or(0);
-    (major, minor, patch)
-}
-
 /// Classify a request for display purposes.
 pub fn request_status_label(req: &VersionRequest, selected_version: Option<&str>) -> &'static str {
     classify_status(req, selected_version)
@@ -734,10 +723,10 @@ mod tests {
 
     #[test]
     fn test_parse_semver() {
-        assert_eq!(parse_semver("2.15.3"), (2, 15, 3));
-        assert_eq!(parse_semver("1.7.36"), (1, 7, 36));
-        assert_eq!(parse_semver("3.2.2-beta"), (3, 2, 2));
-        assert_eq!(parse_semver("6.1"), (6, 1, 0));
-        assert_eq!(parse_semver("2"), (2, 0, 0));
+        assert_eq!(parse_semver("2.15.3"), (2, 15, 3, 0));
+        assert_eq!(parse_semver("1.7.36"), (1, 7, 36, 0));
+        assert_eq!(parse_semver("3.2.2-beta"), (3, 2, 2, 0));
+        assert_eq!(parse_semver("6.1"), (6, 1, 0, 0));
+        assert_eq!(parse_semver("2"), (2, 0, 0, 0));
     }
 }

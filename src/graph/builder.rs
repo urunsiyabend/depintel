@@ -76,6 +76,28 @@ impl DepGraph {
     /// empty-subtree detection still work), and `version_requests` are unioned
     /// per artifact key. Duplicate edges are tolerated.
     pub fn extend_with(&mut self, other: DepGraph) {
+        // 0. Scope comes from selected occurrences, in any module order: one
+        // module's test usage cannot hide a dependency another module ships, and a
+        // losing request's scope never outranks a selected one.
+        for nidx in other.graph.node_indices() {
+            let n = &other.graph[nidx];
+            let is_selected = |requests: &HashMap<ArtifactKey, Vec<VersionRequest>>| {
+                requests
+                    .get(&n.key)
+                    .is_some_and(|reqs| reqs.iter().any(|r| r.selected && r.version == n.version))
+            };
+            if !is_selected(&other.version_requests) {
+                continue;
+            }
+            if let Some(&existing) = self.node_index.get(&(n.key.clone(), n.version.clone())) {
+                if !is_selected(&self.version_requests)
+                    || (self.graph[existing].scope == Scope::Test && n.scope != Scope::Test)
+                {
+                    self.graph[existing].scope = n.scope.clone();
+                }
+            }
+        }
+
         // 1. Union version_requests.
         for (key, reqs) in other.version_requests {
             self.version_requests
@@ -309,6 +331,12 @@ fn add_children(
                 })
             });
 
+        // An omitted occurrence seen first reports the scope of its own path; only
+        // the selected occurrence carries the resolved scope.
+        if selected {
+            graph[child_idx].scope = child.artifact.scope.clone();
+        }
+
         // Edge — the rich semantics live on VersionRequest, the edge itself is just structural.
         graph.add_edge(parent_idx, child_idx, ());
 
@@ -517,5 +545,69 @@ mod tests {
                 "org.baz:qux:2.0",
             ]
         );
+    }
+
+    #[test]
+    fn selected_occurrence_defines_node_scope() {
+        let input = r#"com.example:app:jar:1.0
++- org.foo:helper:jar:1.0:test
+|  \- (org.foo:lib:jar:1.0:test - omitted for duplicate)
+\- org.foo:lib:jar:1.0:compile"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_graph(&trees[0]);
+        let node = graph
+            .find_node_versioned(&ArtifactKey::new("org.foo", "lib"), "1.0")
+            .unwrap();
+        assert_eq!(graph.graph[node].scope, Scope::Compile);
+    }
+
+    #[test]
+    fn combined_graph_keeps_non_test_scope_from_any_module() {
+        let input = "com.example:module-a:jar:1.0\n\
+                     \\- org.foo:lib:jar:1.0:test\n\
+                     com.example:module-b:jar:1.0\n\
+                     \\- org.foo:lib:jar:1.0:compile";
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_combined_graph(&trees);
+        let node = graph
+            .find_node_versioned(&ArtifactKey::new("org.foo", "lib"), "1.0")
+            .unwrap();
+        assert_eq!(graph.graph[node].scope, Scope::Compile);
+    }
+
+    #[test]
+    fn combined_graph_ignores_scope_of_losing_requests() {
+        let input = "com.example:module-a:jar:1.0\n\
+                     \\- org.foo:lib:jar:1.0:test\n\
+                     com.example:module-b:jar:1.0\n\
+                     +- org.foo:lib:jar:2.0:compile\n\
+                     \\- org.foo:other:jar:1.0:compile\n\
+                     \x20  \\- (org.foo:lib:jar:1.0:compile - omitted for conflict with 2.0)";
+        let trees = parse_verbose_tree(input).unwrap();
+        let graph = build_combined_graph(&trees);
+        let node = graph
+            .find_node_versioned(&ArtifactKey::new("org.foo", "lib"), "1.0")
+            .unwrap();
+        assert_eq!(graph.graph[node].scope, Scope::Test);
+    }
+
+    #[test]
+    fn combined_graph_scope_does_not_depend_on_module_order() {
+        let losing = "com.example:module-a:jar:1.0\n\
+                      +- org.foo:lib:jar:2.0:compile\n\
+                      \\- org.foo:other:jar:1.0:compile\n\
+                      \x20  \\- (org.foo:lib:jar:1.0:compile - omitted for conflict with 2.0)";
+        let selected = "com.example:module-b:jar:1.0\n\\- org.foo:lib:jar:1.0:test";
+        for input in [
+            format!("{losing}\n{selected}"),
+            format!("{selected}\n{losing}"),
+        ] {
+            let trees = parse_verbose_tree(&input).unwrap();
+            let graph = build_combined_graph(&trees);
+            let node = graph
+                .find_node_versioned(&ArtifactKey::new("org.foo", "lib"), "1.0")
+                .unwrap();
+            assert_eq!(graph.graph[node].scope, Scope::Test, "{input}");
+        }
     }
 }
