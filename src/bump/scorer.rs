@@ -59,7 +59,7 @@ pub struct VersionJumpInfo {
     pub is_downgrade: bool,
 }
 
-/// Parsed version: `(major, minor, patch, pre_rank)`.
+/// Parsed version: `(major, minor, patch, build, pre_rank)`.
 /// `pre_rank = 0` means "stable release", higher values are progressively
 /// *earlier* pre-releases (rc < beta < alpha < snapshot). Two stable releases
 /// therefore compare by the numeric triple alone; a pre-release of the same
@@ -69,14 +69,22 @@ struct ParsedVersion {
     major: u32,
     minor: u32,
     patch: u32,
+    /// Fourth numeric segment, as in micro-patches like Jackson's 2.9.10.8.
+    build: u32,
     pre_rank: u32,
 }
 
 impl ParsedVersion {
-    fn tuple(&self) -> (u32, u32, u32, i64) {
+    fn tuple(&self) -> (u32, u32, u32, u32, i64) {
         // Invert pre_rank so that `pre_rank=0` (stable) sorts *after* any
         // pre-release for the same numeric triple.
-        (self.major, self.minor, self.patch, -(self.pre_rank as i64))
+        (
+            self.major,
+            self.minor,
+            self.patch,
+            self.build,
+            -(self.pre_rank as i64),
+        )
     }
 }
 
@@ -102,9 +110,17 @@ fn parse_semver(version: &str) -> ParsedVersion {
     let minor = nums.get(1).copied().unwrap_or(0);
     let patch = nums.get(2).copied().unwrap_or(0);
 
+    let build = nums.get(3).copied().unwrap_or(0);
+
     let pre_rank = pre_rank(tail);
 
-    ParsedVersion { major, minor, patch, pre_rank }
+    ParsedVersion {
+        major,
+        minor,
+        patch,
+        build,
+        pre_rank,
+    }
 }
 
 fn pre_rank(tail: &str) -> u32 {
@@ -112,6 +128,12 @@ fn pre_rank(tail: &str) -> u32 {
         return 0;
     }
     let lc = tail.to_ascii_lowercase();
+    // A bare letter is a pre-release only when a number or nothing follows it;
+    // words such as "android" or "bin" merely start with the same letter.
+    let abbreviated = |prefix: char| {
+        let mut chars = lc.chars();
+        chars.next() == Some(prefix) && chars.next().map_or(true, |c| c.is_ascii_digit())
+    };
     // Higher = earlier (more risky). Ordered so that `rc > stable` is false:
     // stable=0 is the greatest via the inversion in `tuple()`.
     if lc.starts_with("rc") || lc.starts_with("cr") {
@@ -119,15 +141,18 @@ fn pre_rank(tail: &str) -> u32 {
     } else if lc.starts_with("m") && lc.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) {
         // Milestone like "M1", "M2".
         2
-    } else if lc.starts_with("beta") || lc.starts_with('b') {
+    } else if lc.starts_with("beta") || abbreviated('b') {
         3
-    } else if lc.starts_with("alpha") || lc.starts_with('a') {
+    } else if lc.starts_with("alpha") || abbreviated('a') {
         4
     } else if lc.starts_with("snapshot") {
         5
     } else {
-        // Vendor qualifiers like "Final", "RELEASE", "GA" are effectively stable.
-        if lc == "final" || lc == "release" || lc == "ga" {
+        // Vendor qualifiers like "Final", "RELEASE", "GA", "SP1" are effectively stable.
+        let service_pack = lc
+            .strip_prefix("sp")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()));
+        if lc == "final" || lc == "release" || lc == "ga" || service_pack {
             0
         } else {
             // Unknown qualifier — treat as slightly pre-release so downgrades
@@ -353,4 +378,47 @@ pub fn recommended_actions(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fourth_numeric_segment_participates_in_downgrade_detection() {
+        assert!(classify_version_jump("2.9.10.8", "2.9.10.1").is_downgrade);
+        assert!(!classify_version_jump("2.9.10.1", "2.9.10.8").is_downgrade);
+        assert!(classify_version_jump("2.9.10.1", "2.9.10").is_downgrade);
+    }
+
+    #[test]
+    fn platform_and_service_pack_qualifiers_are_not_early_prereleases() {
+        for (from, to) in [
+            ("33.0.0-jre", "33.0.0-android"),
+            ("33.0.0-android", "33.0.0-jre"),
+            ("5.4.0.Final", "5.4.0.SP1"),
+            ("1.0.0-bin", "1.0.0-jre"),
+        ] {
+            assert!(
+                !classify_version_jump(from, to).is_downgrade,
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_prerelease_qualifiers_still_rank_below_release() {
+        for prerelease in [
+            "1.0.0-a1",
+            "1.0.0-b2",
+            "1.0.0-alpha",
+            "1.0.0-beta.1",
+            "1.0.0-rc1",
+        ] {
+            assert!(
+                classify_version_jump("1.0.0", prerelease).is_downgrade,
+                "{prerelease}"
+            );
+        }
+    }
 }

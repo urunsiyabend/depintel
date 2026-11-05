@@ -8,7 +8,6 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::bump::mutator::{discover_module_poms, mutate_pom_xml, try_patch_in_place};
 use crate::collector::maven::{self, CollectGoals, MavenOutput};
@@ -31,6 +30,7 @@ pub struct OverrideResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[cfg(unix)]
     #[test]
@@ -429,10 +429,7 @@ pub fn collect_with_override(
         match maven::discover_mvn(pom_dir) {
             Ok(mvn) => {
                 eprintln!("Verifying build with mutated POM...");
-                let output = Command::new(&mvn)
-                    .args(["compile", "-q", "-B"])
-                    .current_dir(pom_dir)
-                    .output();
+                let output = maven::verify_command(&mvn, pom_dir, maven::mvn_settings()).output();
                 match output {
                     Ok(o) => {
                         if o.status.success() {

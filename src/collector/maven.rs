@@ -471,6 +471,21 @@ fn run_mvn(mvn: &Path, pom_dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The settings file registered through `--settings`, if any.
+pub fn mvn_settings() -> Option<&'static Path> {
+    MVN_SETTINGS.get().map(PathBuf::as_path)
+}
+
+/// Build the `mvn compile` command used by `bump --verify`.
+pub fn verify_command(mvn: &Path, pom_dir: &Path, settings: Option<&Path>) -> Command {
+    let mut cmd = Command::new(mvn);
+    cmd.current_dir(pom_dir).args(["compile", "-q", "-B"]);
+    if let Some(settings) = settings {
+        cmd.arg("-s").arg(settings);
+    }
+    cmd
+}
+
 /// Find the directory containing pom.xml, given a --pom flag value.
 pub fn resolve_pom_dir(pom_path: &Path) -> Result<PathBuf> {
     let pom_path = if pom_path.is_relative() {
@@ -517,5 +532,21 @@ mod tests {
         let abs = PathBuf::from("/abs/path/settings2.xml");
         let resolved = absolutize_settings(abs.clone(), cwd);
         assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn verify_command_forwards_settings_file() {
+        let settings = Path::new("/abs/settings.xml");
+        let args = |settings| -> Vec<String> {
+            verify_command(Path::new("mvn"), Path::new("."), settings)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(None), vec!["compile", "-q", "-B"]);
+        assert_eq!(
+            args(Some(settings)),
+            vec!["compile", "-q", "-B", "-s", "/abs/settings.xml"]
+        );
     }
 }

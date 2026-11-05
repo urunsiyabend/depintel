@@ -17,7 +17,7 @@ use crate::bump::scorer::{
 use crate::bump::strategy::{self, FixStrategy};
 use crate::cli::list::collect_or_cache;
 use crate::collector::{maven::CollectGoals, verbose_tree};
-use crate::graph::builder::{self, DepGraph};
+use crate::graph::builder::{self, DepGraph, VersionRequest};
 use crate::model::ArtifactKey;
 use crate::output::color;
 
@@ -60,6 +60,14 @@ pub fn run(
         .context("Missing target version. Use --to <version> or group:artifact:version")?
         .to_string();
 
+    // Check before the baseline run: forcing it would invalidate the project cache.
+    if offline {
+        anyhow::bail!(
+            "bump requires running Maven against the modified POM — --offline is not supported. \
+             Omit --offline so Maven can resolve the target version."
+        );
+    }
+
     // 1. Baseline — force a fresh run so we diff against the *current* pom.xml,
     // not whatever the cache has. Comparing a stale cache to a freshly mutated
     // POM produces phantom added/removed entries from unrelated edits.
@@ -83,9 +91,9 @@ pub fn run(
     let key = ArtifactKey::new(&group, &artifact);
     let baseline_selected = baseline_graph
         .get_requests(&key)
-        .and_then(|reqs| reqs.iter().find(|r| r.selected).cloned());
-    let baseline_version = match baseline_selected.as_ref() {
-        Some(r) => r.version.clone(),
+        .and_then(|reqs| baseline_selected_version(reqs, &target_version));
+    let baseline_version = match baseline_selected {
+        Some(version) => version,
         None => anyhow::bail!(
             "Artifact '{}:{}' is not in the resolved dependency graph.\n\
              `depintel bump` can only preview artifacts that are actually selected in the current tree.",
@@ -135,12 +143,6 @@ pub fn run(
         .unwrap_or_else(|| "compile".to_string());
 
     // 2. Override — mutate POM, run Maven, restore POM.
-    if offline {
-        anyhow::bail!(
-            "bump requires running Maven against the modified POM — --offline is not supported. \
-             Omit --offline so Maven can resolve the target version."
-        );
-    }
     let override_output_dir = pom_dir.join(".depintel").join("bump-preview");
 
     let override_result = runner::collect_with_override(
@@ -175,7 +177,7 @@ pub fn run(
     // Sanity check #1: did Maven actually resolve the target version?
     let override_selected = override_graph
         .get_requests(&key)
-        .and_then(|reqs| reqs.iter().find(|r| r.selected).cloned());
+        .and_then(|reqs| override_selected_request(reqs, &target_version));
     match override_selected.as_ref() {
         Some(req) if req.version == target_version => {}
         Some(req) => anyhow::bail!(
@@ -190,6 +192,19 @@ pub fn run(
              Verify: https://central.sonatype.com/artifact/{}/{}",
             group, artifact, target_version, group, artifact
         ),
+    }
+
+    let baseline_requests = baseline_graph.get_requests(&key).map(Vec::as_slice);
+    let override_requests = override_graph.get_requests(&key).map(Vec::as_slice);
+    if !override_took_effect(
+        baseline_requests.unwrap_or_default(),
+        override_requests.unwrap_or_default(),
+    ) {
+        anyhow::bail!(
+            "The override did not change the version of {}:{} selected by any module: \
+             {} is still selected alongside {}. A module may pin it in a way the bump cannot reach.",
+            group, artifact, baseline_version, target_version
+        );
     }
 
     // Sanity check #2: did Maven actually DOWNLOAD the target's POM?
@@ -301,6 +316,49 @@ pub fn run(
     } else {
         Ok(BumpOutcome::Ok)
     }
+}
+
+/// The version a bump moves away from. Modules of a combined graph can select
+/// different versions, so the target only counts as the baseline when every
+/// module already selects it.
+fn baseline_selected_version(requests: &[VersionRequest], target: &str) -> Option<String> {
+    let mut selected = requests.iter().filter(|r| r.selected);
+    let first = selected.clone().next()?;
+    Some(
+        selected
+            .find(|r| r.version != target)
+            .unwrap_or(first)
+            .version
+            .clone(),
+    )
+}
+
+/// Whether the override changed the version selected by any module. Reaching the
+/// target proves nothing on its own when another module already selected it.
+fn override_took_effect(baseline: &[VersionRequest], override_: &[VersionRequest]) -> bool {
+    let selected = |requests: &[VersionRequest]| {
+        let mut versions: Vec<String> = requests
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.version.clone())
+            .collect();
+        versions.sort();
+        versions
+    };
+    selected(baseline) != selected(override_)
+}
+
+/// The request proving the override resolved: the target when any module selects
+/// it, since modules that do not declare the artifact can keep their own version.
+fn override_selected_request(requests: &[VersionRequest], target: &str) -> Option<VersionRequest> {
+    let mut selected = requests.iter().filter(|r| r.selected);
+    let first = selected.clone().next()?;
+    Some(
+        selected
+            .find(|r| r.version == target)
+            .unwrap_or(first)
+            .clone(),
+    )
 }
 
 fn parse_spec(
@@ -599,4 +657,98 @@ fn print_text(preview: &BumpPreview, scope: &str) {
     println!();
     println!("{}", DISCLAIMER_TEXT);
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lib_requests() -> Vec<VersionRequest> {
+        let trees = verbose_tree::parse_verbose_tree(
+            "org.fixture:module-a:jar:1.0\n\\- org.example:lib:jar:2.0:compile\n\
+             org.fixture:module-b:jar:1.0\n\\- org.example:lib:jar:1.0:compile",
+        )
+        .unwrap();
+        builder::build_combined_graph(&trees)
+            .get_requests(&ArtifactKey::new("org.example", "lib"))
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn target_already_selected_in_one_module_is_not_a_noop() {
+        assert_eq!(
+            baseline_selected_version(&lib_requests(), "2.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            baseline_selected_version(&lib_requests(), "3.0").as_deref(),
+            Some("2.0")
+        );
+    }
+
+    #[test]
+    fn target_selected_in_any_module_satisfies_override_check() {
+        let selected = override_selected_request(&lib_requests(), "1.0").unwrap();
+        assert_eq!(selected.version, "1.0");
+        let fallback = override_selected_request(&lib_requests(), "9.9").unwrap();
+        assert_ne!(fallback.version, "9.9");
+    }
+
+    #[test]
+    fn offline_bump_reports_support_error_and_keeps_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join(".depintel");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("verbose-tree.txt"), "cached").unwrap();
+        let error = run(
+            dir.path(),
+            "text",
+            "org.example:lib",
+            Some("2.0"),
+            false,
+            false,
+            true,
+        )
+        .err()
+        .expect("offline bump must fail");
+        assert!(
+            format!("{error:#}").contains("--offline is not supported"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("verbose-tree.txt")).unwrap(),
+            "cached"
+        );
+    }
+
+    #[test]
+    fn override_without_any_module_change_is_detected() {
+        let requests = |input: &str| {
+            let trees = verbose_tree::parse_verbose_tree(input).unwrap();
+            builder::build_combined_graph(&trees)
+                .get_requests(&ArtifactKey::new("org.example", "lib"))
+                .unwrap()
+                .clone()
+        };
+        let module = |name: &str, version: &str| {
+            format!("org.fixture:{name}:jar:1.0\n\\- org.example:lib:jar:{version}:compile")
+        };
+        let two = |a: &str, b: &str| format!("{}\n{}", module("a", a), module("b", b));
+        let baseline = requests(&two("2.0", "1.0"));
+        assert!(!override_took_effect(
+            &baseline,
+            &requests(&two("2.0", "1.0"))
+        ));
+        assert!(override_took_effect(
+            &baseline,
+            &requests(&two("2.0", "2.0"))
+        ));
+        // A shared version moving in only one of several modules still counts.
+        let three = |a: &str, b: &str, c: &str| format!("{}\n{}", two(a, b), module("c", c));
+        assert!(override_took_effect(
+            &requests(&three("2.0", "1.0", "1.0")),
+            &requests(&three("2.0", "2.0", "1.0"))
+        ));
+    }
 }
