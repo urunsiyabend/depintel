@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.12
+
+Backward-compatible bug fixes; public commands and report schemas are unchanged.
+
+### Fixed
+
+- Preserve managed dependency and BOM coordinates when effective POM entries contain exclusions; excluded artifacts no longer replace the managed artifact's identity.
+- Preserve resolved runtime, test and provided scopes in verbose dependency trees with scope-only annotations, including classified artifacts and mixed scope/version annotations.
+- Do not interpret `scope managed from compile` as a managed version on omitted conflict or duplicate nodes, preventing false version-management metadata.
+
+### Tests
+
+- Complete suite: 142 passing tests, including three independently reproduced RED/GREEN regressions for the fixes above.
+
 ## 0.1.11
 
 Backward-compatible bug fixes; public commands and report schemas are unchanged.

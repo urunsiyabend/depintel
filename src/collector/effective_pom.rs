@@ -130,6 +130,11 @@ pub fn parse_effective_pom(xml: &str) -> Result<Vec<ModuleInfo>> {
                 }
 
                 if in_dependency {
+                    // Exclusion coordinates describe another artifact, not the
+                    // managed entry. Only consume the dependency's own fields.
+                    if !project_depth.is_some_and(|d| depth == d + 4) {
+                        continue;
+                    }
                     match current_element.as_str() {
                         "groupId" => dep_group_id = text,
                         "artifactId" => dep_artifact_id = text,
@@ -202,6 +207,40 @@ pub fn parse_effective_pom(xml: &str) -> Result<Vec<ModuleInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_dependency_coordinates_ignore_nested_exclusions() {
+        let xml = r#"<project>
+  <groupId>org.example</groupId><artifactId>app</artifactId><version>1</version>
+  <dependencyManagement><dependencies>
+    <dependency>
+      <groupId>org.library</groupId><artifactId>library</artifactId><version>2</version>
+      <exclusions><exclusion>
+        <groupId>org.excluded</groupId><artifactId>excluded</artifactId>
+      </exclusion></exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.bom</groupId><artifactId>bom</artifactId><version>3</version>
+      <type>pom</type><scope>import</scope>
+      <exclusions><exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion></exclusions>
+    </dependency>
+  </dependencies></dependencyManagement>
+</project>"#;
+        let modules = parse_effective_pom(xml).unwrap();
+        let module = &modules[0];
+        assert_eq!(module.managed_dependencies.len(), 2);
+        assert_eq!(
+            module.managed_dependencies[0].key,
+            ArtifactKey::new("org.library", "library")
+        );
+        assert_eq!(module.managed_dependencies[0].version, "2");
+        assert_eq!(module.bom_imports.len(), 1);
+        assert_eq!(
+            module.bom_imports[0].key,
+            ArtifactKey::new("org.bom", "bom")
+        );
+        assert_eq!(module.bom_imports[0].version, "3");
+    }
 
     #[test]
     fn project_coordinates_do_not_come_from_parent() {

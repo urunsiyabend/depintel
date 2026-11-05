@@ -217,32 +217,13 @@ fn parse_status_and_managed(s: &str) -> (&str, NodeStatus, Option<String>) {
     //   (artifact:coords:scope - version managed from A; omitted for conflict with X.Y.Z)
     //   (artifact:coords:scope - scope updated from runtime; omitted for conflict with X.Y.Z)
 
-    // Selected node with a trailing parenthesized "(... managed from X)" group.
-    for pattern in &["(version managed from ", "(managed from "] {
-        if let Some(idx) = s.rfind(pattern) {
-            let managed_from = Some(extract_until_delim(&s[idx + pattern.len()..]));
-            return (s[..idx].trim(), NodeStatus::Selected, managed_from);
-        }
-    }
-
     // Parenthesized omitted entry: "(coords:scope - <annotations>)".
     if let Some(stripped) = s.strip_prefix('(') {
         let inner = stripped.strip_suffix(')').unwrap_or(stripped);
 
-        // Coordinates are everything before the first annotation (" - ").
-        let artifact_part = match inner.find(" - ") {
-            Some(i) => &inner[..i],
-            None => inner,
-        };
-
-        // Pull an inline "managed from X" out of the annotation block, if present.
-        let mut managed_from = None;
-        for pattern in &["version managed from ", "managed from "] {
-            if let Some(idx) = inner.find(pattern) {
-                managed_from = Some(extract_until_delim(&inner[idx + pattern.len()..]));
-                break;
-            }
-        }
+        // Coordinates precede the annotation block (" - ").
+        let (artifact_part, annotations) = inner.split_once(" - ").unwrap_or((inner, ""));
+        let managed_from = parse_managed_version(annotations);
 
         // Match the omit reason by phrase, independent of the " - " / "; " separator.
         let status = if let Some(idx) = inner.find("omitted for conflict with ") {
@@ -259,7 +240,26 @@ fn parse_status_and_managed(s: &str) -> (&str, NodeStatus, Option<String>) {
         return (artifact_part, status, managed_from);
     }
 
+    // Selected entries carry annotations after the coordinates. Scope-only
+    // annotations must be removed too, or Scope::parse sees the whole suffix
+    // and silently defaults runtime/test/provided dependencies to compile.
+    if let Some((coordinates, annotations)) = s.split_once(" (") {
+        let managed_from = parse_managed_version(annotations);
+        return (coordinates.trim(), NodeStatus::Selected, managed_from);
+    }
+
     (s, NodeStatus::Selected, None)
+}
+
+/// Match whole annotations so "scope managed from" cannot become a version.
+fn parse_managed_version(annotations: &str) -> Option<String> {
+    annotations.split(';').find_map(|annotation| {
+        let annotation = annotation.trim();
+        annotation
+            .strip_prefix("version managed from ")
+            .or_else(|| annotation.strip_prefix("managed from "))
+            .map(extract_until_delim)
+    })
 }
 
 /// Read a value from the start of `s` up to the next ';' or ')' delimiter,
@@ -308,6 +308,39 @@ fn parse_coordinates(s: &str) -> Option<Artifact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_scope_management_is_not_a_managed_version() {
+        for reason in ["omitted for duplicate", "omitted for conflict with 3.0"] {
+            let input =
+                format!("(org.foo:lib:jar:2.0:runtime - scope managed from compile; {reason})");
+            let (coordinates, status, managed_from) = parse_status_and_managed(&input);
+            assert_eq!(coordinates, "org.foo:lib:jar:2.0:runtime");
+            assert_ne!(status, NodeStatus::Selected);
+            assert_eq!(managed_from, None);
+        }
+    }
+
+    #[test]
+    fn selected_scope_annotations_preserve_resolved_scope() {
+        let input = r#"[INFO] com.example:app:jar:1.0
+[INFO] +- org.foo:runtime-lib:jar:2.0:runtime (scope managed from compile)
+[INFO] +- org.foo:test-lib:jar:tests:2.0:test (scope updated from compile)
+[INFO] \- org.foo:mixed-lib:jar:2.0:provided (scope managed from compile; version managed from 1.0)"#;
+        let trees = parse_verbose_tree(input).unwrap();
+        let children = &trees[0].root.children;
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].artifact.scope, Scope::Runtime);
+        assert_eq!(children[0].managed_from, None);
+        assert_eq!(children[1].artifact.scope, Scope::Test);
+        assert_eq!(children[1].managed_from, None);
+        assert_eq!(children[1].artifact.classifier.as_deref(), Some("tests"));
+        assert_eq!(children[2].artifact.scope, Scope::Provided);
+        assert_eq!(children[2].managed_from.as_deref(), Some("1.0"));
+        assert!(children
+            .iter()
+            .all(|node| node.status == NodeStatus::Selected));
+    }
 
     #[test]
     fn test_parse_children_under_last_branch() {
