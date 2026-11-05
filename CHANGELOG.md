@@ -13,7 +13,7 @@ Backward-compatible bug fixes; public commands and report schemas are unchanged.
 - Take combined multi-module scopes from selected occurrences regardless of module order.
 - Audit every version selected across modules during `bump`, and report version changes in all modules instead of only the first selected version.
 - Do not treat a bump target selected by only one module as a no-op or as proof that the override worked; report an error when no module's selection changed.
-- Count CVEs fixed by earlier releases as closed by a newer fix-plan target, and never prefer an older branch backport or a pre-release over a real upgrade. Text recommendations use the same choice.
+- Count CVEs fixed by earlier releases as closed by a newer fix-plan target, unless OSV shows the advisory reintroduced at or below that target, the target falls inside an unpatched `last_affected` range, or all its fixes predate the current version. Such CVEs stay in `cves_remaining`. Never offer an older version or prefer a pre-release as a fix: when no upgrade closes a CVE the plan reports `(no fix available)`. Text recommendations use the same choice.
 - Keep per-vulnerability summary counts under `audit --severity`.
 - Use the highest severity among advisory records sharing a CVE in `bump` CVE deltas, so an unrated first record cannot hide a critical introduction.
 - Parse qualified version segments in `conflicts` and `why` (`31.1-jre` was read as minor 0) and compare fourth numeric segments; such conflicts now report the correct jump and downgrades.
@@ -25,7 +25,7 @@ Backward-compatible bug fixes; public commands and report schemas are unchanged.
 
 ### Tests
 
-- Complete suite: 180 passing tests. Of 38 new tests, 33 reproduced their bug RED before going GREEN, four are compatibility guards that already passed, and one covers the OSV cache schema change. OSV pagination uses offline fixtures.
+- Complete suite: 199 passing tests. Of 57 new tests, 48 reproduced their bug RED before going GREEN, eight are compatibility guards that already passed, and one covers the OSV cache schema change. OSV pagination and advisory reintroduction use offline fixtures.
 
 ## 0.1.12
 

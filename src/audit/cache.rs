@@ -9,7 +9,7 @@ use crate::audit::osv::Vulnerability;
 const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60; // 24h
                                                // Enriched results omit the raw data needed to recheck withdrawal/package scope.
                                                // Invalidate older results when enrichment semantics change.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Disk-backed cache for OSV vulnerability lookups, keyed by `group:artifact:version`.
 /// One JSON file per coordinate. Lives in the user's cache dir so it's shared across projects.
@@ -23,7 +23,18 @@ struct CacheEntry {
     #[serde(default)]
     schema_version: u32,
     fetched_at: u64,
-    vulns: Vec<Vulnerability>,
+    vulns: Vec<CachedVulnerability>,
+}
+
+/// Keeps data that fix planning needs but the report JSON must not expose.
+#[derive(Serialize, Deserialize)]
+struct CachedVulnerability {
+    #[serde(flatten)]
+    vuln: Vulnerability,
+    #[serde(default)]
+    unfixed_from: Vec<String>,
+    #[serde(default)]
+    last_affected: Vec<String>,
 }
 
 impl OsvCache {
@@ -80,7 +91,17 @@ impl OsvCache {
         {
             return Ok(None);
         }
-        Ok(Some(entry.vulns))
+        Ok(Some(
+            entry
+                .vulns
+                .into_iter()
+                .map(|cached| Vulnerability {
+                    unfixed_from: cached.unfixed_from,
+                    last_affected: cached.last_affected,
+                    ..cached.vuln
+                })
+                .collect(),
+        ))
     }
 
     /// Persist a lookup result. Best-effort: errors are surfaced so the caller can choose
@@ -89,7 +110,14 @@ impl OsvCache {
         let entry = CacheEntry {
             schema_version: CACHE_SCHEMA_VERSION,
             fetched_at: now_unix(),
-            vulns: vulns.to_vec(),
+            vulns: vulns
+                .iter()
+                .map(|vuln| CachedVulnerability {
+                    vuln: vuln.clone(),
+                    unfixed_from: vuln.unfixed_from.clone(),
+                    last_affected: vuln.last_affected.clone(),
+                })
+                .collect(),
         };
         let path = self.path_for(key);
         let body = serde_json::to_string(&entry)?;
@@ -167,6 +195,8 @@ mod tests {
             cvss_score: Some(7.5),
             fixed_versions: vec!["1.0.1".to_string()],
             sources: vec!["GHSA".to_string()],
+            unfixed_from: vec![],
+            last_affected: vec![],
         };
         cache.put("g:a:1.0.0", &[v.clone()]).unwrap();
         let loaded = cache.get("g:a:1.0.0").unwrap().unwrap();
@@ -217,9 +247,35 @@ mod tests {
         let path = cache.path_for("org.example:lib:1.0");
         let mut entry: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // Version 1 entries can hold CVSS v4 severities and GIT commit "fixes".
-        entry["schema_version"] = serde_json::Value::from(1);
-        std::fs::write(&path, entry.to_string()).unwrap();
-        assert!(cache.get("org.example:lib:1.0").unwrap().is_none());
+        // Version 1 entries can hold CVSS v4 severities and GIT commit "fixes";
+        // version 2 entries lack the unfixed ranges fix planning needs.
+        for previous in [1, 2] {
+            entry["schema_version"] = serde_json::Value::from(previous);
+            std::fs::write(&path, entry.to_string()).unwrap();
+            assert!(cache.get("org.example:lib:1.0").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn unfixed_ranges_survive_the_cache_round_trip() {
+        let (_dir, cache) = temp_cache();
+        let mut vuln = Vulnerability {
+            id: "GHSA-test".to_string(),
+            aliases: vec![],
+            summary: String::new(),
+            severity: VulnSeverity::High,
+            cvss_score: None,
+            fixed_versions: vec!["2.0".to_string()],
+            sources: vec![],
+            unfixed_from: vec![],
+            last_affected: vec![],
+        };
+        vuln.unfixed_from.push("3.0".to_string());
+        vuln.last_affected.push("1.9".to_string());
+        cache.put("org.example:lib:3.5", &[vuln]).unwrap();
+        let cached = cache.get("org.example:lib:3.5").unwrap().unwrap();
+        assert_eq!(cached[0].fixed_versions, vec!["2.0"]);
+        assert_eq!(cached[0].unfixed_from, vec!["3.0"]);
+        assert_eq!(cached[0].last_affected, vec!["1.9"]);
     }
 }

@@ -431,6 +431,8 @@ mod tests {
             cvss_score: None,
             fixed_versions: fixed.iter().map(|v| v.to_string()).collect(),
             sources: vec![],
+            unfixed_from: vec![],
+            last_affected: vec![],
         }
     }
 
@@ -468,5 +470,11 @@ mod tests {
         apply_severity_filter(&mut report, VulnSeverity::High);
         assert_eq!(report.summary.critical, 1);
         assert_eq!(report.summary.high, 2);
+    }
+
+    #[test]
+    fn recommendation_never_offers_a_fix_older_than_current() {
+        let vulns = vec![vuln("GHSA-a", VulnSeverity::High, &["2.0"])];
+        assert_eq!(recommend_upgrade(&vulns, "3.5"), None);
     }
 }

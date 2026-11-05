@@ -307,6 +307,8 @@ mod tests {
             cvss_score: None,
             fixed_versions: vec![],
             sources: vec![],
+            unfixed_from: vec![],
+            last_affected: vec![],
         }
     }
 

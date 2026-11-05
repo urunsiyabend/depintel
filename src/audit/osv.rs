@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::cache::OsvCache;
+use crate::audit::fix_plan::{numerically_before, supersedes};
 
 const OSV_QUERYBATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
 const OSV_VULN_URL: &str = "https://api.osv.dev/v1/vulns/";
@@ -66,6 +67,13 @@ pub struct Vulnerability {
     pub fixed_versions: Vec<String>,
     /// Source DB names (e.g., "GHSA", "NVD").
     pub sources: Vec<String>,
+    /// Introduced events with no later fix: versions from here on stay affected.
+    /// Internal to fix planning, so it stays out of the report JSON.
+    #[serde(skip)]
+    pub unfixed_from: Vec<String>,
+    /// Upper bounds of ranges that end without a fix, likewise internal.
+    #[serde(skip)]
+    pub last_affected: Vec<String>,
 }
 
 /// Query argument: identifies one (Maven coordinate, version) pair.
@@ -273,6 +281,9 @@ fn enrich_vuln(raw: OsvVuln, query: &OsvQuery) -> Vulnerability {
     // Fixed versions: pull from `affected[*].ranges[*].events` where event.fixed is set,
     // restricted to entries that match this artifact.
     let mut fixed_versions: Vec<String> = Vec::new();
+    let mut unfixed_from: Vec<String> = Vec::new();
+    let mut closed_from: Vec<&str> = Vec::new();
+    let mut last_affected: Vec<String> = Vec::new();
     if let Some(ref affected) = raw.affected {
         for aff in affected {
             let matches = aff
@@ -304,11 +315,36 @@ fn enrich_vuln(raw: OsvVuln, query: &OsvQuery) -> Vulnerability {
                                 }
                             }
                         }
+                        last_affected.extend(events.iter().flat_map(|ev| ev.last_affected.clone()));
+                        for (position, ev) in events.iter().enumerate() {
+                            let Some(ref introduced) = ev.introduced else {
+                                continue;
+                            };
+                            // Versions order events first. Producers list events in order,
+                            // so position decides what versions cannot, such as M1 and M5.
+                            let closed = events.iter().enumerate().any(|(other, event)| {
+                                event
+                                    .fixed
+                                    .as_deref()
+                                    .or(event.last_affected.as_deref())
+                                    .is_some_and(|closing| {
+                                        supersedes(closing, introduced)
+                                            || (other > position
+                                                && !numerically_before(closing, introduced))
+                                    })
+                            });
+                            if closed {
+                                closed_from.push(introduced.as_str());
+                            } else if !unfixed_from.contains(introduced) {
+                                unfixed_from.push(introduced.clone());
+                            }
+                        }
                     }
                 }
             }
         }
     }
+    unfixed_from.retain(|from| !closed_from.contains(&from.as_str()));
     fixed_versions.sort();
 
     // Sources: distinct values of `database_specific.source` plus the prefix of the ID.
@@ -334,6 +370,8 @@ fn enrich_vuln(raw: OsvVuln, query: &OsvQuery) -> Vulnerability {
         cvss_score,
         fixed_versions,
         sources,
+        unfixed_from,
+        last_affected,
     }
 }
 
@@ -488,6 +526,8 @@ pub struct OsvEvent {
     pub introduced: Option<String>,
     #[serde(default)]
     pub fixed: Option<String>,
+    #[serde(default)]
+    pub last_affected: Option<String>,
 }
 
 #[cfg(test)]
@@ -570,6 +610,8 @@ mod tests {
             cvss_score: None,
             fixed_versions: vec!["99.0".into()],
             sources: vec!["GHSA".into()],
+            unfixed_from: vec![],
+            last_affected: vec![],
         };
         cache.put(&queries[0].cache_key(), &[legacy]).unwrap();
         let path = std::fs::read_dir(dir.path())
@@ -919,5 +961,244 @@ mod tests {
         let ids = |i: usize| results[i].iter().map(|v| v.id.as_str()).collect::<Vec<_>>();
         assert_eq!(ids(0), vec!["GHSA-a"]);
         assert_eq!(ids(1), vec!["GHSA-b", "GHSA-c"]);
+    }
+
+    fn enrich_events(ranges: serde_json::Value) -> Vulnerability {
+        let raw: OsvVuln = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test",
+            "affected": [
+                {"package": {"ecosystem": "Maven", "name": "org.example:lib"}, "ranges": ranges},
+                {"package": {"ecosystem": "Maven", "name": "org.example:other"},
+                 "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0"}]}]}
+            ],
+        }))
+        .unwrap();
+        enrich_vuln(
+            raw,
+            &OsvQuery {
+                group: "org.example".to_string(),
+                artifact: "lib".to_string(),
+                version: "3.5".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn introduced_events_without_a_later_fix_are_recorded() {
+        for (ranges, expected) in [
+            // Reopened in one range, and with event order reversed.
+            (
+                serde_json::json!([{"type": "ECOSYSTEM", "events": [
+                    {"introduced": "0"}, {"fixed": "2.0"}, {"introduced": "3.0"}
+                ]}]),
+                vec!["3.0"],
+            ),
+            (
+                serde_json::json!([{"type": "ECOSYSTEM", "events": [
+                    {"introduced": "3.0"}, {"fixed": "2.0"}, {"introduced": "0"}
+                ]}]),
+                vec!["3.0"],
+            ),
+            // Reopened through a separate range.
+            (
+                serde_json::json!([
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "2.0"}]},
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "3.0"}]}
+                ]),
+                vec!["3.0"],
+            ),
+            // A later fix closes every range; GIT ranges do not hold Maven versions.
+            (
+                serde_json::json!([
+                    {"type": "ECOSYSTEM", "events": [
+                        {"introduced": "0"}, {"fixed": "2.0"},
+                        {"introduced": "3.0"}, {"fixed": "4.0"}
+                    ]},
+                    {"type": "GIT", "events": [{"introduced": "abc123"}]}
+                ]),
+                vec![],
+            ),
+        ] {
+            assert_eq!(
+                enrich_events(ranges.clone()).unfixed_from,
+                expected,
+                "{ranges}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfixed_ranges_stay_out_of_report_json() {
+        let vuln = enrich_events(serde_json::json!([{"type": "ECOSYSTEM", "events": [
+            {"introduced": "0"}, {"fixed": "2.0"}, {"introduced": "3.0"}
+        ]}]));
+        let output = serde_json::to_value(&vuln).unwrap();
+        let mut keys: Vec<_> = output.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "aliases",
+                "cvss_score",
+                "fixed_versions",
+                "id",
+                "severity",
+                "sources",
+                "summary"
+            ]
+        );
+    }
+
+    #[test]
+    fn reintroduced_osv_advisory_stays_open_at_the_fix_plan_target() {
+        use crate::audit::fix_plan::compute_fix_plan;
+        use crate::audit::report::{AuditFinding, AuditReport, AuditSummary};
+
+        let advisory = |id: &str, events: serde_json::Value| {
+            let mut vuln = enrich_events(serde_json::json!([
+                {"type": "ECOSYSTEM", "events": events}
+            ]));
+            vuln.aliases = vec![id.to_string()];
+            vuln
+        };
+        let vulnerabilities = vec![
+            advisory(
+                "CVE-A",
+                serde_json::json!([{"introduced": "0"}, {"fixed": "2.0"}, {"introduced": "3.0"}]),
+            ),
+            advisory(
+                "CVE-B",
+                serde_json::json!([{"introduced": "0"}, {"fixed": "4.0"}]),
+            ),
+        ];
+        let plan = compute_fix_plan(&[AuditReport {
+            module: "app".to_string(),
+            summary: AuditSummary::default(),
+            findings: vec![AuditFinding {
+                group: "org.example".to_string(),
+                artifact: "lib".to_string(),
+                version: "3.5".to_string(),
+                scope: "compile".to_string(),
+                direct: true,
+                paths: vec![],
+                vulnerabilities,
+                max_severity: VulnSeverity::High,
+            }],
+            artifacts_scanned: 1,
+        }]);
+        assert_eq!(plan.upgrades[0].to_version, "4.0");
+        assert_eq!(plan.upgrades[0].cves_fixed, vec!["CVE-B"]);
+        assert_eq!(plan.upgrades[0].cves_remaining, vec!["CVE-A"]);
+        assert_eq!(plan.total_cves_fixed, 1);
+        assert_eq!(plan.total_cves_remaining, 1);
+    }
+
+    #[test]
+    fn closed_ranges_are_not_recorded_as_unfixed() {
+        for ranges in [
+            // last_affected closes a range without naming a fix.
+            serde_json::json!([{"events": [
+                {"introduced": "8.5.0"}, {"last_affected": "8.5.100"}
+            ]}]),
+            // Pre-release qualifiers on equal numbers are not ordered by value.
+            serde_json::json!([{"events": [
+                {"introduced": "11.0.0-M1"}, {"fixed": "11.0.0-M5"}
+            ]}]),
+            serde_json::json!([{"events": [
+                {"introduced": "4.1.0.Beta1"}, {"fixed": "4.1.0.CR1"}
+            ]}]),
+            serde_json::json!([{"events": [{"introduced": "v1.0"}, {"fixed": "v2.0"}]}]),
+            // A qualified fix of the same numbers follows its introduction.
+            serde_json::json!([{"events": [
+                {"introduced": "5.3.7"}, {"fixed": "5.3.7.SP1"}
+            ]}]),
+            serde_json::json!([{"events": [
+                {"introduced": "3.0.0.Final"}, {"fixed": "3.0.0.SP1"}
+            ]}]),
+            serde_json::json!([{"events": [{"introduced": "32.0"}, {"fixed": "32.0-jre"}]}]),
+            serde_json::json!([{"events": [{"introduced": "2.0.0"}, {"fixed": "2.0.0-1"}]}]),
+            // A bare range is closed by another range starting at the same version.
+            serde_json::json!([
+                {"events": [{"introduced": "0"}]},
+                {"events": [{"introduced": "0"}, {"fixed": "1.1"}]}
+            ]),
+        ] {
+            assert!(
+                enrich_events(ranges.clone()).unfixed_from.is_empty(),
+                "{ranges}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_reopened_after_an_unordered_fix_stays_unfixed() {
+        let vuln = enrich_events(serde_json::json!([{"events": [
+            {"introduced": "0"}, {"fixed": "1.0-M5"}, {"introduced": "1.0-RC1"}
+        ]}]));
+        assert_eq!(vuln.unfixed_from, vec!["1.0-RC1"]);
+        // An overlapping range starting elsewhere does not close an open one.
+        let vuln = enrich_events(serde_json::json!([
+            {"events": [{"introduced": "0"}, {"fixed": "5.0"}]},
+            {"events": [{"introduced": "3.0"}]}
+        ]));
+        assert_eq!(vuln.unfixed_from, vec!["3.0"]);
+    }
+
+    #[test]
+    fn last_affected_branch_keeps_later_branch_fixes_valid() {
+        use crate::audit::fix_plan::best_fixed_version;
+        // Shape of GHSA-25xr-qj8w-c4vf: an unpatched old branch and three fixed ones.
+        let vuln = enrich_events(serde_json::json!([
+            {"type": "ECOSYSTEM", "events": [{"introduced": "8.5.0"}, {"last_affected": "8.5.100"}]},
+            {"type": "ECOSYSTEM", "events": [{"introduced": "9.0.0-M1"}, {"fixed": "9.0.107"}]},
+            {"type": "ECOSYSTEM", "events": [{"introduced": "10.1.0-M1"}, {"fixed": "10.1.43"}]},
+            {"type": "ECOSYSTEM", "events": [{"introduced": "11.0.0-M1"}, {"fixed": "11.0.9"}]}
+        ]));
+        assert_eq!(
+            best_fixed_version(&[vuln], "9.0.50").as_deref(),
+            Some("11.0.9")
+        );
+    }
+
+    #[test]
+    fn target_inside_a_last_affected_range_is_not_inferred_fixed() {
+        use crate::audit::fix_plan::compute_fix_plan;
+        use crate::audit::report::{AuditFinding, AuditReport, AuditSummary};
+
+        let plan_with = |other_fix: &str| {
+            // Shape of GHSA-3pxv-7cmr-fjr4: fixed on one branch, unpatched pre-releases.
+            let mut bounded = enrich_events(serde_json::json!([
+                {"events": [{"introduced": "0"}, {"fixed": "2.25.4"}]},
+                {"events": [{"introduced": "3.0.0-alpha1"}, {"last_affected": "3.0.0-beta3"}]}
+            ]));
+            bounded.aliases = vec!["CVE-A".to_string()];
+            let mut other = enrich_events(serde_json::json!([
+                {"events": [{"introduced": "0"}, {"fixed": other_fix}]}
+            ]));
+            other.aliases = vec!["CVE-B".to_string()];
+            compute_fix_plan(&[AuditReport {
+                module: "app".to_string(),
+                summary: AuditSummary::default(),
+                findings: vec![AuditFinding {
+                    group: "org.example".to_string(),
+                    artifact: "lib".to_string(),
+                    version: "2.20.0".to_string(),
+                    scope: "compile".to_string(),
+                    direct: true,
+                    paths: vec![],
+                    vulnerabilities: vec![bounded, other],
+                    max_severity: VulnSeverity::High,
+                }],
+                artifacts_scanned: 1,
+            }])
+        };
+        let inside = plan_with("3.0.0-beta2");
+        assert_eq!(inside.upgrades[0].to_version, "3.0.0-beta2");
+        assert_eq!(inside.upgrades[0].cves_fixed, vec!["CVE-B"]);
+        assert_eq!(inside.upgrades[0].cves_remaining, vec!["CVE-A"]);
+        // Above the bound the ordinary inference still closes both.
+        let above = plan_with("3.0.0");
+        assert_eq!(above.upgrades[0].to_version, "3.0.0");
+        assert_eq!(above.upgrades[0].cves_fixed, vec!["CVE-A", "CVE-B"]);
     }
 }
