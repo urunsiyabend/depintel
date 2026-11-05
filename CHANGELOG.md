@@ -27,6 +27,11 @@ Backward-compatible bug fixes; public commands and report schemas are unchanged.
 
 - Complete suite: 199 passing tests. Of 57 new tests, 48 reproduced their bug RED before going GREEN, eight are compatibility guards that already passed, and one covers the OSV cache schema change. OSV pagination and advisory reintroduction use offline fixtures.
 
+### Known limitations
+
+- Fix-plan version ordering is conservative for same-number qualifiers: upgrades such as `5.3.7` to `5.3.7.SP1` can report `(no fix available)`. The advisory remains reported rather than being marked fixed.
+- Fix plans remain heuristic: conflicting advisory records sharing a CVE can disagree about fixes, and an exact fix in one record can take precedence. Re-audit the proposed target before relying on a plan as security clearance.
+
 ## 0.1.12
 
 Backward-compatible bug fixes; public commands and report schemas are unchanged.
