@@ -9,7 +9,7 @@ use crate::audit::osv::Vulnerability;
 const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60; // 24h
                                                // Enriched results omit the raw data needed to recheck withdrawal/package scope.
                                                // Invalidate older results when enrichment semantics change.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Disk-backed cache for OSV vulnerability lookups, keyed by `group:artifact:version`.
 /// One JSON file per coordinate. Lives in the user's cache dir so it's shared across projects.
@@ -207,5 +207,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         // ttl=0 → anything older than now is expired
         assert!(cache.get("g:a:1.0.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn entries_from_previous_schema_are_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OsvCache::in_directory(dir.path().to_path_buf());
+        cache.put("org.example:lib:1.0", &[]).unwrap();
+        let path = cache.path_for("org.example:lib:1.0");
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Version 1 entries can hold CVSS v4 severities and GIT commit "fixes".
+        entry["schema_version"] = serde_json::Value::from(1);
+        std::fs::write(&path, entry.to_string()).unwrap();
+        assert!(cache.get("org.example:lib:1.0").unwrap().is_none());
     }
 }

@@ -135,22 +135,49 @@ impl OsvClient {
 
         // OSV's batch endpoint accepts up to ~1000 queries; chunk to be safe.
         const BATCH_SIZE: usize = 500;
+        // A runaway page token must fail loudly rather than cache a partial result.
+        const MAX_PAGES: usize = 100;
         for chunk in to_fetch_idx.chunks(BATCH_SIZE) {
-            let body = build_querybatch_body(chunk.iter().map(|&i| &queries[i]));
-            let resp: QueryBatchResponse = self
-                .agent
-                .post(querybatch_url)
-                .send_json(body)
-                .context("OSV /v1/querybatch failed")?
-                .into_json()
-                .context("Failed to decode OSV /v1/querybatch response")?;
-
-            if resp.results.len() != chunk.len() {
-                anyhow::bail!(
-                    "OSV returned {} results for {} queries — protocol mismatch",
-                    resp.results.len(),
-                    chunk.len()
+            // OSV paginates per query: results carrying `next_page_token` are incomplete
+            // until the same query is re-sent with that token as `page_token`.
+            let mut chunk_ids: Vec<Vec<VulnRef>> = chunk.iter().map(|_| Vec::new()).collect();
+            let mut pending: Vec<(usize, Option<String>)> =
+                (0..chunk.len()).map(|position| (position, None)).collect();
+            let mut pages = 0;
+            while !pending.is_empty() {
+                pages += 1;
+                if pages > MAX_PAGES {
+                    anyhow::bail!("OSV /v1/querybatch returned more than {MAX_PAGES} pages");
+                }
+                let body = build_querybatch_body(
+                    pending
+                        .iter()
+                        .map(|(position, token)| (&queries[chunk[*position]], token.as_deref())),
                 );
+                let resp: QueryBatchResponse = self
+                    .agent
+                    .post(querybatch_url)
+                    .send_json(body)
+                    .context("OSV /v1/querybatch failed")?
+                    .into_json()
+                    .context("Failed to decode OSV /v1/querybatch response")?;
+
+                if resp.results.len() != pending.len() {
+                    anyhow::bail!(
+                        "OSV returned {} results for {} queries — protocol mismatch",
+                        resp.results.len(),
+                        pending.len()
+                    );
+                }
+
+                let mut next_pending = Vec::new();
+                for ((position, _), result) in pending.iter().zip(resp.results) {
+                    chunk_ids[*position].extend(result.vulns.unwrap_or_default());
+                    if let Some(token) = result.next_page_token.filter(|t| !t.is_empty()) {
+                        next_pending.push((*position, Some(token)));
+                    }
+                }
+                pending = next_pending;
             }
 
             // For each query in this chunk, OSV gives us only vuln IDs.
@@ -158,25 +185,23 @@ impl OsvClient {
             let mut id_cache: std::collections::HashMap<String, OsvVuln> =
                 std::collections::HashMap::new();
 
-            for (slot, batch_result) in chunk.iter().zip(resp.results.iter()) {
+            for (slot, ids) in chunk.iter().zip(chunk_ids.iter()) {
                 let mut vulns: Vec<Vulnerability> = Vec::new();
-                if let Some(ref ids) = batch_result.vulns {
-                    for vuln_ref in ids {
-                        let detail = if let Some(cached) = id_cache.get(&vuln_ref.id) {
-                            cached.clone()
-                        } else {
-                            let detail = self
-                                .fetch_vuln(&vuln_ref.id, vuln_url)
-                                .with_context(|| format!("Failed to fetch {}", vuln_ref.id))?;
-                            id_cache.insert(vuln_ref.id.clone(), detail.clone());
-                            detail
-                        };
-                        if detail.withdrawn.is_some() {
-                            continue;
-                        }
-                        // A shared advisory can specify different fixes for each package.
-                        vulns.push(enrich_vuln(detail, &queries[*slot]));
+                for vuln_ref in ids {
+                    let detail = if let Some(cached) = id_cache.get(&vuln_ref.id) {
+                        cached.clone()
+                    } else {
+                        let detail = self
+                            .fetch_vuln(&vuln_ref.id, vuln_url)
+                            .with_context(|| format!("Failed to fetch {}", vuln_ref.id))?;
+                        id_cache.insert(vuln_ref.id.clone(), detail.clone());
+                        detail
+                    };
+                    if detail.withdrawn.is_some() {
+                        continue;
                     }
+                    // A shared advisory can specify different fixes for each package.
+                    vulns.push(enrich_vuln(detail, &queries[*slot]));
                 }
                 self.cache.put(&queries[*slot].cache_key(), &vulns)?;
                 results[*slot] = Some(vulns);
@@ -199,16 +224,22 @@ impl OsvClient {
     }
 }
 
-fn build_querybatch_body<'a>(queries: impl Iterator<Item = &'a OsvQuery>) -> serde_json::Value {
+fn build_querybatch_body<'a>(
+    queries: impl Iterator<Item = (&'a OsvQuery, Option<&'a str>)>,
+) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = queries
-        .map(|q| {
-            serde_json::json!({
+        .map(|(q, page_token)| {
+            let mut query = serde_json::json!({
                 "package": {
                     "ecosystem": "Maven",
                     "name": q.maven_name(),
                 },
                 "version": q.version,
-            })
+            });
+            if let Some(token) = page_token {
+                query["page_token"] = serde_json::Value::from(token);
+            }
+            query
         })
         .collect();
     serde_json::json!({ "queries": arr })
@@ -257,6 +288,14 @@ fn enrich_vuln(raw: OsvVuln, query: &OsvQuery) -> Vulnerability {
             }
             if let Some(ref ranges) = aff.ranges {
                 for range in ranges {
+                    // GIT range events hold commit hashes, not Maven versions.
+                    if range
+                        .r#type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("GIT"))
+                    {
+                        continue;
+                    }
                     if let Some(ref events) = range.events {
                         for ev in events {
                             if let Some(ref fixed) = ev.fixed {
@@ -321,12 +360,23 @@ fn parse_cvss_base_score(score: &str) -> Option<f64> {
     let ac = metrics.get("AC").map(String::as_str).unwrap_or("");
     let pr = metrics.get("PR").map(String::as_str).unwrap_or("");
     let ui = metrics.get("UI").map(String::as_str).unwrap_or("");
-    let c = metrics.get("C").map(String::as_str).unwrap_or("");
-    let i = metrics.get("I").map(String::as_str).unwrap_or("");
-    let a = metrics.get("A").map(String::as_str).unwrap_or("");
+    let metric = |name: &str| metrics.get(name).map(String::as_str).unwrap_or("");
+    let is_v4 = score.starts_with("CVSS:4.");
+    // CVSS v4 splits impact into vulnerable (VC/VI/VA) and subsequent (SC/SI/SA) systems.
+    let (c, i, a) = if is_v4 {
+        (metric("VC"), metric("VI"), metric("VA"))
+    } else {
+        (metric("C"), metric("I"), metric("A"))
+    };
+    let subsequent = [metric("SC"), metric("SI"), metric("SA")];
 
     if av.is_empty() && c.is_empty() {
         return None;
+    }
+
+    // A CVSS v4 vector with no impact on either system also scores zero.
+    if is_v4 && [c, i, a].iter().chain(&subsequent).all(|x| *x == "N") {
+        return Some(0.0);
     }
 
     // CVSS v3 has a zero base score when all three impact metrics are None,
@@ -340,7 +390,10 @@ fn parse_cvss_base_score(score: &str) -> Option<f64> {
     }
 
     // Approximate base impact: HIGH on any of C/I/A → strong contribution.
-    let impact_count = [c, i, a].iter().filter(|x| **x == "H").count();
+    let mut impact_count = [c, i, a].iter().filter(|x| **x == "H").count();
+    if impact_count == 0 && subsequent.contains(&"H") {
+        impact_count = 1;
+    }
     let mut score: f64 = match impact_count {
         3 => 9.0,
         2 => 7.5,
@@ -375,6 +428,8 @@ struct QueryBatchResponse {
 #[derive(Debug, Deserialize)]
 struct QueryBatchResult {
     vulns: Option<Vec<VulnRef>>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,6 +476,8 @@ pub struct OsvPackage {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OsvRange {
+    #[serde(default)]
+    pub r#type: Option<String>,
     #[serde(default)]
     pub events: Option<Vec<OsvEvent>>,
 }
@@ -474,7 +531,9 @@ mod tests {
                     }
                 };
                 let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-                assert!(headers.starts_with(expected), "{headers}");
+                let (expected_head, expected_body) =
+                    expected.split_once('|').unwrap_or((expected, ""));
+                assert!(headers.starts_with(expected_head), "{headers}");
                 let content_length: usize = headers
                     .lines()
                     .find_map(|line| {
@@ -485,6 +544,8 @@ mod tests {
                     .unwrap_or(0);
                 let mut body_bytes = vec![0; content_length];
                 stream.read_exact(&mut body_bytes).unwrap();
+                let received = String::from_utf8_lossy(&body_bytes);
+                assert!(received.contains(expected_body), "{received}");
                 let body = body.to_string();
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
@@ -751,12 +812,112 @@ mod tests {
             artifact: "log4j-core".to_string(),
             version: "2.14.1".to_string(),
         };
-        let body = build_querybatch_body(std::iter::once(&q));
+        let body = build_querybatch_body(std::iter::once((&q, None)));
         assert_eq!(body["queries"][0]["package"]["ecosystem"], "Maven");
         assert_eq!(
             body["queries"][0]["package"]["name"],
             "org.apache.logging.log4j:log4j-core"
         );
         assert_eq!(body["queries"][0]["version"], "2.14.1");
+        assert!(body["queries"][0].get("page_token").is_none());
+        let body = build_querybatch_body(std::iter::once((&q, Some("tok-1"))));
+        assert_eq!(body["queries"][0]["page_token"], "tok-1");
+    }
+
+    #[test]
+    fn cvss_v4_vector_uses_v4_impact_metrics() {
+        let query = OsvQuery {
+            group: "org.example".to_string(),
+            artifact: "lib".to_string(),
+            version: "1.0".to_string(),
+        };
+        for (vector, expected) in [
+            (
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+                VulnSeverity::Critical,
+            ),
+            (
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+                VulnSeverity::High,
+            ),
+            (
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:H/SI:N/SA:N",
+                VulnSeverity::High,
+            ),
+            (
+                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N",
+                VulnSeverity::Unknown,
+            ),
+        ] {
+            let raw: OsvVuln = serde_json::from_value(serde_json::json!({
+                "id": "GHSA-test",
+                "severity": [{"type": "CVSS_V4", "score": vector}],
+            }))
+            .unwrap();
+            assert_eq!(enrich_vuln(raw, &query).severity, expected, "{vector}");
+        }
+    }
+
+    #[test]
+    fn git_range_commits_are_not_reported_as_fixed_versions() {
+        let query = OsvQuery {
+            group: "org.example".to_string(),
+            artifact: "lib".to_string(),
+            version: "1.0".to_string(),
+        };
+        let raw: OsvVuln = serde_json::from_value(serde_json::json!({
+            "id": "GHSA-test",
+            "affected": [{
+                "package": {"ecosystem": "Maven", "name": "org.example:lib"},
+                "ranges": [
+                    {"type": "GIT", "events": [{"introduced": "0"}, {"fixed": "8f3a1c0d9e"}]},
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.1"}]}
+                ]
+            }],
+        }))
+        .unwrap();
+        assert_eq!(enrich_vuln(raw, &query).fixed_versions, vec!["1.1"]);
+    }
+
+    #[test]
+    fn querybatch_follows_next_page_token_for_each_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = OsvClient::new(OsvCache::in_directory(dir.path().to_path_buf()));
+        let queries: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|artifact| OsvQuery {
+                group: "org.example".into(),
+                artifact: artifact.into(),
+                version: "1.0".into(),
+            })
+            .collect();
+        let detail = |id: &str| serde_json::json!({"id": id});
+        let (base, server) = fixture_server(vec![
+            (
+                "POST /querybatch ",
+                serde_json::json!({"results": [
+                    {"vulns": [{"id": "GHSA-a"}]},
+                    {"vulns": [{"id": "GHSA-b"}], "next_page_token": "tok-1"}
+                ]}),
+            ),
+            (
+                "POST /querybatch |tok-1",
+                serde_json::json!({"results": [{"vulns": [{"id": "GHSA-c"}]}]}),
+            ),
+            ("GET /vulns/GHSA-a ", detail("GHSA-a")),
+            ("GET /vulns/GHSA-b ", detail("GHSA-b")),
+            ("GET /vulns/GHSA-c ", detail("GHSA-c")),
+        ]);
+        let results = client
+            .query_batch_at(
+                &queries,
+                &format!("{base}/querybatch"),
+                &format!("{base}/vulns/"),
+            )
+            .unwrap();
+        server.join().unwrap();
+        let ids = |i: usize| results[i].iter().map(|v| v.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids(0), vec!["GHSA-a"]);
+        assert_eq!(ids(1), vec!["GHSA-b", "GHSA-c"]);
     }
 }
