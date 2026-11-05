@@ -4,7 +4,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
 
-use crate::audit::osv::VulnSeverity;
+use crate::audit::osv::{VulnSeverity, Vulnerability};
 use crate::audit::report::AuditReport;
 
 #[derive(Debug, Serialize)]
@@ -38,37 +38,21 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
                 continue;
             }
 
-            // Collect all candidate fixed versions across all CVEs for this artifact
-            let mut version_to_fixes: HashMap<&str, Vec<&str>> = HashMap::new();
-            let mut unfixable: Vec<String> = Vec::new();
-
-            for vuln in &finding.vulnerabilities {
-                let vuln_id = preferred_id(vuln);
-                if vuln.fixed_versions.is_empty() {
-                    unfixable.push(vuln_id.to_string());
-                    continue;
-                }
-                for fv in &vuln.fixed_versions {
-                    version_to_fixes
-                        .entry(fv.as_str())
-                        .or_default()
-                        .push(vuln_id);
-                }
-            }
-
-            // OSV can return multiple advisory records with the same CVE alias.
-            // Count CVE identities, not advisory records (or repeated fix events).
-            for ids in version_to_fixes.values_mut() {
-                ids.sort_unstable();
-                ids.dedup();
-            }
+            let mut unfixable: Vec<String> = finding
+                .vulnerabilities
+                .iter()
+                .filter(|vuln| vuln.fixed_versions.is_empty())
+                .map(|vuln| preferred_id(vuln).to_string())
+                .collect();
             unfixable.sort();
             unfixable.dedup();
 
-            if version_to_fixes.is_empty() {
-                // All CVEs are unfixable
-                total_remaining += unfixable.len();
-                if !unfixable.is_empty() {
+            let best_version = match best_fixed_version(&finding.vulnerabilities, &finding.version)
+            {
+                Some(version) => version,
+                None => {
+                    // All CVEs are unfixable
+                    total_remaining += unfixable.len();
                     upgrades.push(UpgradeAction {
                         group: finding.group.clone(),
                         artifact: finding.artifact.clone(),
@@ -79,30 +63,15 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
                         cves_remaining: unfixable,
                         severity_summary: String::new(),
                     });
+                    continue;
                 }
-                continue;
-            }
-
-            // For each candidate version, a CVE is "fixed" if the candidate version
-            // appears in that CVE's fixed_versions list.
-            // Pick the version that fixes the most CVEs. On ties, prefer the one
-            // that sorts newest, comparing digit runs numerically rather than
-            // lexically (so 2.10 ranks above 2.9). This is not a Maven range check.
-            let best_version = version_to_fixes
-                .iter()
-                .max_by(|a, b| {
-                    a.1.len()
-                        .cmp(&b.1.len())
-                        .then_with(|| compare_versions(a.0, b.0))
-                })
-                .map(|(v, _)| *v)
-                .unwrap_or("");
+            };
 
             // Determine which CVEs are fixed by this version
-            let fixed_ids: Vec<String> = version_to_fixes
-                .get(best_version)
-                .map(|ids| ids.iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default();
+            let fixed_ids: Vec<String> = fixed_ids_for(&finding.vulnerabilities, &best_version)
+                .into_iter()
+                .map(String::from)
+                .collect();
 
             // CVEs NOT fixed by the best version (either unfixable or need a different version)
             let mut remaining = unfixable;
@@ -113,9 +82,6 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
                     && !remaining.contains(&vid.to_string())
                     && !vuln.fixed_versions.is_empty()
                 {
-                    // This CVE has a fix but not in the best_version
-                    // Check if best_version would still fix it via version comparison
-                    // For simplicity, we just mark it as remaining
                     remaining.push(vid.to_string());
                 }
             }
@@ -130,7 +96,7 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
                 group: finding.group.clone(),
                 artifact: finding.artifact.clone(),
                 from_version: finding.version.clone(),
-                to_version: best_version.to_string(),
+                to_version: best_version,
                 cves_fixed_count: fixed_ids.len(),
                 cves_fixed: fixed_ids,
                 cves_remaining: remaining,
@@ -150,6 +116,103 @@ pub fn compute_fix_plan(reports: &[AuditReport]) -> FixPlan {
         total_cves_fixed: total_fixed,
         total_cves_remaining: total_remaining,
     }
+}
+
+/// Pick the fixed version closing the most CVEs. Versions newer than `current`
+/// come first, so a backport on an older branch is never preferred over a real
+/// upgrade. On ties, prefer the version OSV names explicitly for the most CVEs,
+/// then the newest one. This is not a Maven range check.
+pub fn best_fixed_version(vulns: &[Vulnerability], current: &str) -> Option<String> {
+    let mut candidates: Vec<&str> = vulns
+        .iter()
+        .flat_map(|vuln| vuln.fixed_versions.iter().map(String::as_str))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.iter().any(|c| supersedes(c, current)) {
+        candidates.retain(|c| supersedes(c, current));
+    }
+    candidates
+        .into_iter()
+        .max_by(|a, b| {
+            let rank = |version: &str| {
+                let mut named: Vec<&str> = vulns
+                    .iter()
+                    .filter(|vuln| vuln.fixed_versions.iter().any(|fixed| fixed == version))
+                    .map(preferred_id)
+                    .collect();
+                named.sort_unstable();
+                named.dedup();
+                (fixed_ids_for(vulns, version).len(), named.len())
+            };
+            rank(a).cmp(&rank(b)).then_with(|| {
+                if supersedes(a, b) {
+                    std::cmp::Ordering::Greater
+                } else if supersedes(b, a) {
+                    std::cmp::Ordering::Less
+                } else {
+                    compare_versions(a, b)
+                }
+            })
+        })
+        .map(String::from)
+}
+
+/// CVE identities closed by `target`, deduplicated across advisory records:
+/// OSV can return several records with the same CVE alias.
+fn fixed_ids_for<'a>(vulns: &'a [Vulnerability], target: &str) -> Vec<&'a str> {
+    let mut ids: Vec<&str> = vulns
+        .iter()
+        .filter(|vuln| {
+            // A release newer than every fix event carries all of them. A target
+            // between events may sit on another release branch, so it needs an
+            // exact match to count.
+            !vuln.fixed_versions.is_empty()
+                && (vuln.fixed_versions.iter().any(|fixed| fixed == target)
+                    || vuln
+                        .fixed_versions
+                        .iter()
+                        .all(|fixed| supersedes(target, fixed)))
+        })
+        .map(preferred_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Whether `candidate` is known to be released after `fixed`. Numeric parts decide
+/// first. With equal numbers, only a release following a qualified build counts:
+/// 2.0.0 and 4.1.0.Final follow their release candidates, while unrelated
+/// qualifiers such as -jre and -android are not ordered.
+fn supersedes(candidate: &str, fixed: &str) -> bool {
+    let (candidate_numbers, candidate_qualifier) = split_qualifier(candidate);
+    let (fixed_numbers, fixed_qualifier) = split_qualifier(fixed);
+    match compare_versions(candidate_numbers, fixed_numbers) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            is_release_qualifier(candidate_qualifier) && !is_release_qualifier(fixed_qualifier)
+        }
+    }
+}
+
+fn split_qualifier(version: &str) -> (&str, &str) {
+    let end = version
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(version.len());
+    let (numbers, qualifier) = version.split_at(end);
+    (
+        numbers.trim_end_matches('.'),
+        qualifier.trim_start_matches(['-', '.', '_']),
+    )
+}
+
+fn is_release_qualifier(qualifier: &str) -> bool {
+    qualifier.is_empty()
+        || ["final", "release", "ga"]
+            .iter()
+            .any(|known| qualifier.eq_ignore_ascii_case(known))
 }
 
 /// Natural ordering for upgrade tie-breaking, not Maven range evaluation.
@@ -186,7 +249,7 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     left.len().cmp(&right.len()).then_with(|| a.cmp(b))
 }
 
-fn preferred_id(vuln: &crate::audit::osv::Vulnerability) -> &str {
+fn preferred_id(vuln: &Vulnerability) -> &str {
     vuln.aliases
         .iter()
         .find(|a| a.starts_with("CVE-"))
@@ -194,10 +257,7 @@ fn preferred_id(vuln: &crate::audit::osv::Vulnerability) -> &str {
         .unwrap_or(&vuln.id)
 }
 
-fn build_severity_summary(
-    vulns: &[crate::audit::osv::Vulnerability],
-    fixed_ids: &[String],
-) -> String {
+fn build_severity_summary(vulns: &[Vulnerability], fixed_ids: &[String]) -> String {
     let mut crit = 0;
     let mut high = 0;
     let mut med = 0;
@@ -241,7 +301,6 @@ fn build_severity_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::osv::Vulnerability;
     use crate::audit::report::{AuditFinding, AuditReport, AuditSummary};
 
     fn make_vuln(id: &str, severity: VulnSeverity, fixed: Vec<&str>) -> Vulnerability {
@@ -379,5 +438,114 @@ mod tests {
         let plan = compute_fix_plan(&[report]);
         assert_eq!(plan.total_cves_remaining, 1);
         assert_eq!(plan.total_cves_fixed, 0);
+    }
+
+    fn plan_for(vulnerabilities: Vec<Vulnerability>) -> FixPlan {
+        compute_fix_plan(&[AuditReport {
+            module: "test".to_string(),
+            summary: AuditSummary::default(),
+            findings: vec![AuditFinding {
+                group: "org.example".to_string(),
+                artifact: "lib".to_string(),
+                version: "1.0".to_string(),
+                scope: "compile".to_string(),
+                direct: true,
+                paths: vec![],
+                vulnerabilities,
+                max_severity: VulnSeverity::High,
+            }],
+            artifacts_scanned: 1,
+        }])
+    }
+
+    #[test]
+    fn newer_target_counts_cves_fixed_by_earlier_releases() {
+        let plan = plan_for(vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["1.1"]),
+            make_vuln("CVE-2024-002", VulnSeverity::Critical, vec!["1.2"]),
+        ]);
+        assert_eq!(plan.upgrades[0].to_version, "1.2");
+        assert_eq!(plan.upgrades[0].cves_fixed_count, 2);
+        assert_eq!(plan.upgrades[0].severity_summary, "1 CRITICAL, 1 HIGH");
+        assert!(plan.upgrades[0].cves_remaining.is_empty());
+        assert_eq!(plan.total_cves_remaining, 0);
+    }
+
+    #[test]
+    fn target_that_supersedes_most_fixes_wins_over_repeated_older_fix() {
+        let plan = plan_for(vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["1.1"]),
+            make_vuln("CVE-2024-002", VulnSeverity::High, vec!["1.1"]),
+            make_vuln("CVE-2024-003", VulnSeverity::High, vec!["1.10"]),
+        ]);
+        assert_eq!(plan.upgrades[0].to_version, "1.10");
+        assert_eq!(plan.total_cves_fixed, 3);
+        assert_eq!(plan.total_cves_remaining, 0);
+    }
+
+    #[test]
+    fn other_branch_fixes_and_prereleases_are_not_assumed_to_fix() {
+        // 1.9.5 cannot be assumed to contain the later 2.1.0 branch fix.
+        let plan = plan_for(vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["1.9.5", "2.1.0"]),
+            make_vuln("CVE-2024-002", VulnSeverity::High, vec!["1.9.6"]),
+        ]);
+        assert_eq!(plan.upgrades[0].to_version, "2.1.0");
+        assert_eq!(plan.total_cves_fixed, 2);
+        // A final release carries its release candidate's fix, not the reverse.
+        let plan = plan_for(vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["2.0.0-rc1"]),
+            make_vuln("CVE-2024-002", VulnSeverity::High, vec!["2.0.0"]),
+        ]);
+        assert_eq!(plan.upgrades[0].to_version, "2.0.0");
+        assert_eq!(plan.total_cves_fixed, 2);
+        assert!(!supersedes("2.0.0-rc1", "2.0.0"));
+        assert!(supersedes("2.0.0", "2.0.0-rc1"));
+        assert!(supersedes("1.0.10", "1.0"));
+    }
+
+    #[test]
+    fn best_fixed_version_matches_fix_plan_target() {
+        let vulns = vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["1.1"]),
+            make_vuln("CVE-2024-002", VulnSeverity::High, vec!["1.2"]),
+        ];
+        assert_eq!(best_fixed_version(&vulns, "1.0").as_deref(), Some("1.2"));
+        assert_eq!(best_fixed_version(&[], "1.0"), None);
+    }
+
+    #[test]
+    fn target_is_never_older_than_current_when_a_newer_fix_exists() {
+        let vulns = vec![
+            make_vuln("CVE-2024-001", VulnSeverity::High, vec!["5.3.33", "6.1.5"]),
+            make_vuln("CVE-2024-002", VulnSeverity::High, vec!["5.3.33", "6.1.6"]),
+        ];
+        assert_eq!(
+            best_fixed_version(&vulns, "6.1.0").as_deref(),
+            Some("6.1.6")
+        );
+        // On the older branch the shared backport stays the smallest upgrade.
+        assert_eq!(
+            best_fixed_version(&vulns, "5.3.0").as_deref(),
+            Some("5.3.33")
+        );
+        // Nothing newer is known: keep reporting OSV's fix rather than nothing.
+        let vulns = vec![make_vuln("CVE-2024-001", VulnSeverity::High, vec!["1.1"])];
+        assert_eq!(best_fixed_version(&vulns, "2.0").as_deref(), Some("1.1"));
+    }
+
+    #[test]
+    fn prerelease_ordering_does_not_depend_on_qualifier_spelling() {
+        assert!(!supersedes("4.1.0.RC1", "4.1.0.Final"));
+        assert!(supersedes("4.1.0.Final", "4.1.0.RC1"));
+        assert!(!supersedes("33.0.0-android", "33.0.0-jre"));
+        assert!(!supersedes("33.0.0-jre", "33.0.0-android"));
+        assert!(supersedes("4.1.1.RC1", "4.1.0.Final"));
+        let vulns = vec![make_vuln(
+            "CVE-2024-001",
+            VulnSeverity::High,
+            vec!["2.0.0", "2.0.0-rc1"],
+        )];
+        assert_eq!(best_fixed_version(&vulns, "1.0").as_deref(), Some("2.0.0"));
     }
 }

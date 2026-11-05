@@ -82,13 +82,7 @@ pub fn run(
 
         if let Some(sev_str) = severity_filter {
             let want = parse_severity(sev_str)?;
-            report.findings.retain(|f| f.max_severity >= want);
-            // Recompute summary so it reflects the filter
-            let mut summary = AuditSummary::default();
-            for f in &report.findings {
-                summary.bump(f.max_severity);
-            }
-            report.summary = summary;
+            apply_severity_filter(&mut report, want);
         }
 
         reports.push(report);
@@ -136,6 +130,17 @@ pub fn run(
     }
 
     Ok(AuditOutcome::Clean)
+}
+
+fn apply_severity_filter(report: &mut AuditReport, want: VulnSeverity) {
+    report.findings.retain(|f| f.max_severity >= want);
+    // Recompute summary so it reflects the filter, counting each vulnerability
+    // like the unfiltered report does.
+    let mut summary = AuditSummary::default();
+    for vuln in report.findings.iter().flat_map(|f| &f.vulnerabilities) {
+        summary.bump(vuln.severity);
+    }
+    report.summary = summary;
 }
 
 fn parse_severity(s: &str) -> Result<VulnSeverity> {
@@ -300,7 +305,7 @@ fn print_finding(f: &AuditFinding, applicability: Option<&ApplicabilityResult>) 
         );
     }
 
-    let recommended = recommend_upgrade(&vulns);
+    let recommended = recommend_upgrade(&vulns, &f.version);
     if let Some(target) = recommended {
         println!(
             "    {} upgrade {} → {}",
@@ -330,18 +335,8 @@ fn print_finding(f: &AuditFinding, applicability: Option<&ApplicabilityResult>) 
     println!();
 }
 
-fn recommend_upgrade(vulns: &[crate::audit::osv::Vulnerability]) -> Option<String> {
-    use std::collections::HashMap;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for v in vulns {
-        for fv in &v.fixed_versions {
-            *counts.entry(fv.as_str()).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
-        .map(|(v, _)| v.to_string())
+fn recommend_upgrade(vulns: &[crate::audit::osv::Vulnerability], current: &str) -> Option<String> {
+    fix_plan::best_fixed_version(vulns, current)
 }
 
 fn print_fix_plan_text(plan: &fix_plan::FixPlan) {
@@ -420,4 +415,58 @@ fn print_json(
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::osv::Vulnerability;
+
+    fn vuln(id: &str, severity: VulnSeverity, fixed: &[&str]) -> Vulnerability {
+        Vulnerability {
+            id: id.to_string(),
+            aliases: vec![],
+            summary: String::new(),
+            severity,
+            cvss_score: None,
+            fixed_versions: fixed.iter().map(|v| v.to_string()).collect(),
+            sources: vec![],
+        }
+    }
+
+    #[test]
+    fn recommended_upgrade_covers_all_fixes_on_a_tie() {
+        let vulns = vec![
+            vuln("GHSA-a", VulnSeverity::High, &["1.1"]),
+            vuln("GHSA-b", VulnSeverity::High, &["1.2"]),
+        ];
+        assert_eq!(recommend_upgrade(&vulns, "1.0").as_deref(), Some("1.2"));
+    }
+
+    #[test]
+    fn severity_filter_keeps_per_vulnerability_summary_counts() {
+        let vulnerabilities = vec![
+            vuln("GHSA-a", VulnSeverity::Critical, &[]),
+            vuln("GHSA-b", VulnSeverity::High, &[]),
+            vuln("GHSA-c", VulnSeverity::High, &[]),
+        ];
+        let mut report = AuditReport {
+            module: "test".to_string(),
+            summary: AuditSummary::default(),
+            findings: vec![AuditFinding {
+                group: "org.example".to_string(),
+                artifact: "lib".to_string(),
+                version: "1.0".to_string(),
+                scope: "compile".to_string(),
+                direct: true,
+                paths: vec![],
+                vulnerabilities,
+                max_severity: VulnSeverity::Critical,
+            }],
+            artifacts_scanned: 1,
+        };
+        apply_severity_filter(&mut report, VulnSeverity::High);
+        assert_eq!(report.summary.critical, 1);
+        assert_eq!(report.summary.high, 2);
+    }
 }

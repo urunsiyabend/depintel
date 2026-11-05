@@ -59,47 +59,46 @@ pub fn build_report(
 ) -> Result<AuditReport> {
     // Collect distinct selected (key, version) pairs from the graph.
     // We only check what was actually selected — overridden versions don't end up on classpath.
+    // A combined multi-module graph can select a different version in each module.
     let mut seen: HashSet<(ArtifactKey, String)> = HashSet::new();
     let mut queries: Vec<OsvQuery> = Vec::new();
     let mut query_meta: Vec<(ArtifactKey, String, String, bool, Vec<Vec<String>>)> = Vec::new();
 
     for (key, requests) in &graph.version_requests {
-        let selected = match requests.iter().find(|r| r.selected) {
-            Some(r) => r,
-            None => continue,
-        };
-        let pair = (key.clone(), selected.version.clone());
-        if !seen.insert(pair.clone()) {
-            continue;
+        for selected in requests.iter().filter(|r| r.selected) {
+            let pair = (key.clone(), selected.version.clone());
+            if !seen.insert(pair) {
+                continue;
+            }
+
+            let scope = graph
+                .find_node_versioned(key, &selected.version)
+                .map(|idx| graph.graph[idx].scope.to_string())
+                .unwrap_or_else(|| "compile".to_string());
+
+            if !include_test && scope == "test" {
+                continue;
+            }
+
+            // Direct = path length 2 (root + this artifact).
+            let direct = selected.path.len() <= 2;
+
+            // Collect *all* paths to this artifact (real + virtual reconstructed).
+            let mut paths: Vec<Vec<String>> = requests
+                .iter()
+                .filter(|r| r.version == selected.version)
+                .map(|r| r.path.clone())
+                .collect();
+            paths.sort();
+            paths.dedup();
+
+            queries.push(OsvQuery {
+                group: key.group_id.clone(),
+                artifact: key.artifact_id.clone(),
+                version: selected.version.clone(),
+            });
+            query_meta.push((key.clone(), selected.version.clone(), scope, direct, paths));
         }
-
-        let scope = graph
-            .find_node_versioned(key, &selected.version)
-            .map(|idx| graph.graph[idx].scope.to_string())
-            .unwrap_or_else(|| "compile".to_string());
-
-        if !include_test && scope == "test" {
-            continue;
-        }
-
-        // Direct = path length 2 (root + this artifact).
-        let direct = selected.path.len() <= 2;
-
-        // Collect *all* paths to this artifact (real + virtual reconstructed).
-        let mut paths: Vec<Vec<String>> = requests
-            .iter()
-            .filter(|r| r.version == selected.version)
-            .map(|r| r.path.clone())
-            .collect();
-        paths.sort();
-        paths.dedup();
-
-        queries.push(OsvQuery {
-            group: key.group_id.clone(),
-            artifact: key.artifact_id.clone(),
-            version: selected.version.clone(),
-        });
-        query_meta.push((key.clone(), selected.version.clone(), scope, direct, paths));
     }
 
     let artifacts_scanned = queries.len();
@@ -140,6 +139,7 @@ pub fn build_report(
         b.max_severity
             .cmp(&a.max_severity)
             .then_with(|| format!("{}:{}", a.group, a.artifact).cmp(&format!("{}:{}", b.group, b.artifact)))
+            .then_with(|| a.version.cmp(&b.version))
     });
 
     Ok(AuditReport {
@@ -148,4 +148,73 @@ pub fn build_report(
         findings,
         artifacts_scanned,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::cache::OsvCache;
+    use crate::collector::verbose_tree::parse_verbose_tree;
+    use crate::graph::builder::{build_combined_graph, build_graph};
+
+    fn vuln(id: &str) -> Vulnerability {
+        Vulnerability {
+            id: id.to_string(),
+            aliases: vec![],
+            summary: String::new(),
+            severity: VulnSeverity::High,
+            cvss_score: None,
+            fixed_versions: vec![],
+            sources: vec![],
+        }
+    }
+
+    fn client_with(entries: &[(&str, &str)]) -> (tempfile::TempDir, OsvClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OsvCache::in_directory(dir.path().to_path_buf());
+        for (key, id) in entries {
+            let vulns = if id.is_empty() {
+                vec![]
+            } else {
+                vec![vuln(id)]
+            };
+            cache.put(key, &vulns).unwrap();
+        }
+        (dir, OsvClient::new(cache))
+    }
+
+    #[test]
+    fn combined_graph_audits_every_selected_version() {
+        let trees = parse_verbose_tree(
+            "org.fixture:module-a:jar:1.0\n\\- org.example:lib:jar:1.0:compile\n\
+             org.fixture:module-b:jar:1.0\n\\- org.example:lib:jar:2.0:compile",
+        )
+        .unwrap();
+        let graph = build_combined_graph(&trees);
+        let (_dir, client) = client_with(&[
+            ("org.example:lib:1.0", "GHSA-old"),
+            ("org.example:lib:2.0", "GHSA-new"),
+        ]);
+        let report = build_report(&graph, &client, false).unwrap();
+        let mut versions: Vec<_> = report.findings.iter().map(|f| f.version.as_str()).collect();
+        versions.sort_unstable();
+        assert_eq!(versions, vec!["1.0", "2.0"]);
+        assert_eq!(report.artifacts_scanned, 2);
+    }
+
+    #[test]
+    fn compile_dependency_is_audited_when_first_seen_as_test_duplicate() {
+        let trees = parse_verbose_tree(
+            "org.fixture:app:jar:1.0\n\
+             +- org.fixture:helper:jar:1.0:test\n\
+             |  \\- (org.example:lib:jar:1.0:test - omitted for duplicate)\n\
+             \\- org.example:lib:jar:1.0:compile",
+        )
+        .unwrap();
+        let graph = build_graph(&trees[0]);
+        let (_dir, client) = client_with(&[("org.example:lib:1.0", "GHSA-live")]);
+        let report = build_report(&graph, &client, false).unwrap();
+        assert_eq!(report.findings.len(), 1, "compile dependency was skipped");
+        assert_eq!(report.findings[0].scope, "compile");
+    }
 }

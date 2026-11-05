@@ -188,6 +188,14 @@ fn known_patterns(group: &str, artifact: &str) -> Option<Vec<String>> {
         ("com.google.code.gson", "gson") => Some(vec!["com.google.gson"]),
         // Guava
         ("com.google.guava", "guava") => Some(vec!["com.google.common"]),
+        // Spring modules whose packages differ from their artifact names
+        ("org.springframework", "spring-webmvc") => Some(vec!["org.springframework.web.servlet"]),
+        ("org.springframework", "spring-webflux") => Some(vec!["org.springframework.web.reactive"]),
+        ("org.springframework", "spring-websocket") => Some(vec!["org.springframework.web.socket"]),
+        ("org.springframework", "spring-tx") => Some(vec![
+            "org.springframework.transaction",
+            "org.springframework.dao",
+        ]),
         // Spring
         ("org.springframework", a) if a.starts_with("spring-") => {
             let module = a.strip_prefix("spring-").unwrap_or(a);
@@ -201,6 +209,23 @@ fn known_patterns(group: &str, artifact: &str) -> Option<Vec<String>> {
             Some(vec!["org.apache.commons.collections4"])
         }
         ("commons-io", "commons-io") => Some(vec!["org.apache.commons.io"]),
+        ("commons-collections", "commons-collections") => {
+            Some(vec!["org.apache.commons.collections"])
+        }
+        ("commons-beanutils", "commons-beanutils") => Some(vec!["org.apache.commons.beanutils"]),
+        ("commons-fileupload", "commons-fileupload") => Some(vec!["org.apache.commons.fileupload"]),
+        ("commons-codec", "commons-codec") => Some(vec!["org.apache.commons.codec"]),
+        ("commons-lang", "commons-lang") => Some(vec!["org.apache.commons.lang"]),
+        // Log4j 1.x
+        ("log4j", "log4j") => Some(vec!["org.apache.log4j"]),
+        // Apache HttpComponents 4.x
+        ("org.apache.httpcomponents", "httpclient" | "httpcore") => Some(vec!["org.apache.http"]),
+        // Embedded Tomcat
+        ("org.apache.tomcat.embed", "tomcat-embed-core") => Some(vec![
+            "org.apache.catalina",
+            "org.apache.coyote",
+            "org.apache.tomcat",
+        ]),
         // SnakeYAML
         ("org.yaml", "snakeyaml") => Some(vec!["org.yaml.snakeyaml"]),
         // Nimbus
@@ -382,5 +407,82 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = scan_usage(dir.path(), "io.netty", "netty-codec-smtp");
         assert_eq!(result.level, ApplicabilityLevel::Unknown);
+    }
+
+    #[test]
+    fn scan_usage_maps_artifacts_whose_packages_differ_from_coordinates() {
+        for (group, artifact, import) in [
+            (
+                "org.springframework",
+                "spring-webmvc",
+                "org.springframework.web.servlet.DispatcherServlet",
+            ),
+            (
+                "org.springframework",
+                "spring-webflux",
+                "org.springframework.web.reactive.DispatcherHandler",
+            ),
+            (
+                "org.springframework",
+                "spring-websocket",
+                "org.springframework.web.socket.WebSocketSession",
+            ),
+            (
+                "org.springframework",
+                "spring-tx",
+                "org.springframework.transaction.PlatformTransactionManager",
+            ),
+            (
+                "commons-collections",
+                "commons-collections",
+                "org.apache.commons.collections.Transformer",
+            ),
+            (
+                "commons-beanutils",
+                "commons-beanutils",
+                "org.apache.commons.beanutils.BeanUtils",
+            ),
+            (
+                "commons-fileupload",
+                "commons-fileupload",
+                "org.apache.commons.fileupload.FileItem",
+            ),
+            (
+                "commons-codec",
+                "commons-codec",
+                "org.apache.commons.codec.binary.Base64",
+            ),
+            (
+                "commons-lang",
+                "commons-lang",
+                "org.apache.commons.lang.StringUtils",
+            ),
+            ("log4j", "log4j", "org.apache.log4j.Logger"),
+            (
+                "org.apache.httpcomponents",
+                "httpclient",
+                "org.apache.http.client.HttpClient",
+            ),
+            (
+                "org.apache.tomcat.embed",
+                "tomcat-embed-core",
+                "org.apache.catalina.Context",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let src = dir.path().join("src/main/java");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("App.java"), format!("import {import};")).unwrap();
+            let result = scan_usage(dir.path(), group, artifact);
+            assert_eq!(result.level, ApplicabilityLevel::High, "{group}:{artifact}");
+        }
+    }
+
+    #[test]
+    fn scan_usage_keeps_generic_spring_module_mapping() {
+        assert_eq!(
+            known_patterns("org.springframework", "spring-core").unwrap(),
+            vec!["org.springframework.core"]
+        );
     }
 }
