@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.13
+
+Backward-compatible bug fixes; public commands and report schemas are unchanged. Severities, conflict downgrades and exit codes can change where earlier results were wrong, and existing OSV cache entries are refetched once.
+
+### Fixed
+
+- Score CVSS v4 vectors from their own impact metrics; advisories previously capped at MEDIUM now reach HIGH or CRITICAL, so `audit` can newly exit 2.
+- Follow OSV `next_page_token` pagination instead of caching truncated advisory lists, and fail rather than cache a partial result if paging does not end.
+- Ignore GIT range events, which hold commit hashes, when reporting fixed versions.
+- Audit a dependency selected in compile scope when an omitted test-scope duplicate appears first in the tree; it was skipped entirely without `--include-test`.
+- Take combined multi-module scopes from selected occurrences regardless of module order.
+- Audit every version selected across modules during `bump`, and report version changes in all modules instead of only the first selected version.
+- Do not treat a bump target selected by only one module as a no-op or as proof that the override worked; report an error when no module's selection changed.
+- Count CVEs fixed by earlier releases as closed by a newer fix-plan target, and never prefer an older branch backport or a pre-release over a real upgrade. Text recommendations use the same choice.
+- Keep per-vulnerability summary counts under `audit --severity`.
+- Use the highest severity among advisory records sharing a CVE in `bump` CVE deltas, so an unrated first record cannot hide a critical introduction.
+- Parse qualified version segments in `conflicts` and `why` (`31.1-jre` was read as minor 0) and compare fourth numeric segments; such conflicts now report the correct jump and downgrades.
+- Detect fourth-segment downgrades in `bump`, and stop treating qualifiers such as `android`, `bin` and `SP1` as early pre-releases.
+- Forward `--settings` to the `bump --verify` build.
+- Preserve runtime, provided and test scopes and the optional flag for `(optional)` entries in `dependency:list` output.
+- Reject `--fresh --offline` and `bump --offline` before invalidating the project cache.
+- Map Spring, Commons, Log4j 1.x, HttpComponents and embedded Tomcat artifacts whose packages differ from their coordinates, avoiding false LOW applicability in `audit --scan-usage`.
+
+### Tests
+
+- Complete suite: 180 passing tests. Of 38 new tests, 33 reproduced their bug RED before going GREEN, four are compatibility guards that already passed, and one covers the OSV cache schema change. OSV pagination uses offline fixtures.
+
 ## 0.1.12
 
 Backward-compatible bug fixes; public commands and report schemas are unchanged.
